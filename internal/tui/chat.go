@@ -314,15 +314,24 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	m.textarea, taCmd = m.textarea.Update(msg)
 	m.viewport, vpCmd = m.viewport.Update(msg)
 
-	// Update command picker visibility based on current input
+	// Update command picker visibility based on current input.
+	// Only reset pickerIdx when the filtered list actually changes (i.e. the
+	// user typed a new character). Blink ticks and other non-key messages must
+	// NOT reset the selection — that was causing the picker to jump to the top.
 	val := m.textarea.Value()
 	if strings.HasPrefix(val, "/") && !strings.Contains(val, " ") {
-		m.pickerItems = filterCommands(val)
-		m.pickerIdx = 0
-		m.showPicker = len(m.pickerItems) > 0
+		newItems := filterCommands(val)
+		listChanged := len(newItems) != len(m.pickerItems) ||
+			(len(newItems) > 0 && len(m.pickerItems) > 0 && newItems[0].cmd != m.pickerItems[0].cmd)
+		if listChanged {
+			m.pickerIdx = 0
+		}
+		m.pickerItems = newItems
+		m.showPicker = len(newItems) > 0
 	} else {
 		m.showPicker = false
 		m.pickerItems = nil
+		m.pickerIdx = 0
 	}
 
 	return m, tea.Batch(taCmd, vpCmd)
