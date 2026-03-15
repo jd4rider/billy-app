@@ -1,0 +1,134 @@
+package backend
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"time"
+)
+
+// OllamaBackend talks to a local Ollama instance.
+type OllamaBackend struct {
+	baseURL string
+	model   string
+	client  *http.Client
+}
+
+// NewOllama creates a new Ollama backend.
+func NewOllama(baseURL, model string) *OllamaBackend {
+	return &OllamaBackend{
+		baseURL: baseURL,
+		model:   model,
+		client:  &http.Client{Timeout: 120 * time.Second},
+	}
+}
+
+func (o *OllamaBackend) Name() string         { return "ollama" }
+func (o *OllamaBackend) CurrentModel() string { return o.model }
+func (o *OllamaBackend) SetModel(model string) { o.model = model }
+
+type ollamaMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+type ollamaChatRequest struct {
+	Model    string          `json:"model"`
+	Messages []ollamaMessage `json:"messages"`
+	Stream   bool            `json:"stream"`
+	Options  ollamaOptions   `json:"options,omitempty"`
+}
+
+type ollamaOptions struct {
+	Temperature float64 `json:"temperature,omitempty"`
+	NumPredict  int     `json:"num_predict,omitempty"`
+}
+
+type ollamaChatResponse struct {
+	Message ollamaMessage `json:"message"`
+	Done    bool          `json:"done"`
+	Error   string        `json:"error,omitempty"`
+}
+
+// Chat sends a conversation history to Ollama and returns the assistant reply.
+func (o *OllamaBackend) Chat(ctx context.Context, history []Message, opts ChatOptions) (string, error) {
+	msgs := make([]ollamaMessage, len(history))
+	for i, m := range history {
+		msgs[i] = ollamaMessage{Role: m.Role, Content: m.Content}
+	}
+
+	reqBody := ollamaChatRequest{
+		Model:    o.model,
+		Messages: msgs,
+		Stream:   false,
+		Options: ollamaOptions{
+			Temperature: opts.Temperature,
+			NumPredict:  opts.NumPredict,
+		},
+	}
+
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("marshal request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, o.baseURL+"/api/chat", bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := o.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("connect to Ollama at %s: %w\n\nMake sure Ollama is running: ollama serve", o.baseURL, err)
+	}
+	defer resp.Body.Close()
+
+	var result ollamaChatResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", fmt.Errorf("decode response: %w", err)
+	}
+
+	if result.Error != "" {
+		return "", fmt.Errorf("ollama error: %s", result.Error)
+	}
+
+	return result.Message.Content, nil
+}
+
+type ollamaModelsResponse struct {
+	Models []struct {
+		Name  string `json:"name"`
+		Size  int64  `json:"size"`
+	} `json:"models"`
+}
+
+// ListModels returns all models available in Ollama.
+func (o *OllamaBackend) ListModels(ctx context.Context) ([]Model, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, o.baseURL+"/api/tags", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := o.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("connect to Ollama at %s: %w", o.baseURL, err)
+	}
+	defer resp.Body.Close()
+
+	var result ollamaModelsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+
+	models := make([]Model, len(result.Models))
+	for i, m := range result.Models {
+		models[i] = Model{
+			Name: m.Name,
+			Size: fmt.Sprintf("%.1f GB", float64(m.Size)/1e9),
+		}
+	}
+	return models, nil
+}
