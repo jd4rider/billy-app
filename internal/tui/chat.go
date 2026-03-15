@@ -42,6 +42,39 @@ var (
 			BorderForeground(lipgloss.Color("5"))
 )
 
+type pickerItem struct {
+	cmd     string
+	desc    string
+	hasArgs bool // true = fill with trailing space; false = execute immediately on Enter
+}
+
+var commandList = []pickerItem{
+	{"/clear", "Clear the current chat", false},
+	{"/compact", "Summarize and compress context", false},
+	{"/help", "Show all commands", false},
+	{"/history", "Browse past conversations", false},
+	{"/memory", "List or manage memories", false},
+	{"/model", "List or switch Ollama models", true},
+	{"/pull", "Download a model from Ollama", true},
+	{"/quit", "Exit Billy", false},
+	{"/resume", "Load a past conversation by ID", true},
+	{"/save", "Save current conversation", false},
+	{"/session", "Save a session checkpoint", false},
+}
+
+func filterCommands(input string) []pickerItem {
+	if input == "/" {
+		return commandList
+	}
+	var out []pickerItem
+	for _, c := range commandList {
+		if strings.HasPrefix(c.cmd, input) {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
 // pullMsg carries progress or completion back into the update loop.
 type pullMsg struct {
 	progress *backend.PullProgress // nil = done
@@ -69,6 +102,9 @@ type ChatModel struct {
 	width          int
 	height         int
 	waiting        bool
+	showPicker     bool
+	pickerItems    []pickerItem
+	pickerIdx      int
 }
 
 // New creates a new ChatModel.
@@ -146,7 +182,39 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.historyList, listCmd = m.historyList.Update(msg)
 			return m, listCmd
 		}
+	// Command picker navigation — intercepts keys when picker is visible
+	if m.showPicker && len(m.pickerItems) > 0 {
 		switch msg.Type {
+		case tea.KeyUp:
+			if m.pickerIdx > 0 {
+				m.pickerIdx--
+			}
+			return m, nil
+		case tea.KeyDown:
+			if m.pickerIdx < len(m.pickerItems)-1 {
+				m.pickerIdx++
+			}
+			return m, nil
+		case tea.KeyEnter:
+			selected := m.pickerItems[m.pickerIdx]
+			if selected.hasArgs {
+				m.textarea.SetValue(selected.cmd + " ")
+			} else {
+				m.textarea.SetValue(selected.cmd)
+			}
+			m.showPicker = false
+			m.pickerIdx = 0
+			if !selected.hasArgs {
+				return m, func() tea.Msg { return tea.KeyMsg{Type: tea.KeyEnter} }
+			}
+			return m, nil
+		case tea.KeyEsc:
+			m.showPicker = false
+			m.pickerIdx = 0
+			return m, nil
+		}
+	}
+	switch msg.Type {
 		case tea.KeyCtrlD, tea.KeyCtrlC:
 			return m, tea.Quit
 		case tea.KeyEnter:
@@ -158,6 +226,7 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			m.textarea.Reset()
+			m.showPicker = false
 
 			if strings.HasPrefix(input, "/") {
 				return m.handleCommand(input)
@@ -244,6 +313,18 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	m.textarea, taCmd = m.textarea.Update(msg)
 	m.viewport, vpCmd = m.viewport.Update(msg)
+
+	// Update command picker visibility based on current input
+	val := m.textarea.Value()
+	if strings.HasPrefix(val, "/") && !strings.Contains(val, " ") {
+		m.pickerItems = filterCommands(val)
+		m.pickerIdx = 0
+		m.showPicker = len(m.pickerItems) > 0
+	} else {
+		m.showPicker = false
+		m.pickerItems = nil
+	}
+
 	return m, tea.Batch(taCmd, vpCmd)
 }
 
@@ -268,8 +349,70 @@ func (m ChatModel) View() string {
 		lipgloss.Left,
 		borderStyle.Width(m.width-2).Render(m.viewport.View()),
 		status,
+		m.renderPicker(),
 		borderStyle.Width(m.width-2).Render(m.textarea.View()),
 	)
+}
+
+func (m ChatModel) renderPicker() string {
+	if !m.showPicker || len(m.pickerItems) == 0 {
+		return ""
+	}
+
+	const maxVisible = 7
+	total := len(m.pickerItems)
+
+	// Scroll window: keep selected item visible
+	start := 0
+	if m.pickerIdx >= maxVisible {
+		start = m.pickerIdx - maxVisible + 1
+	}
+	end := start + maxVisible
+	if end > total {
+		end = total
+	}
+
+	selectedStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("12")).
+		Bold(true)
+	dimRowStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("8"))
+	cmdStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("7"))
+
+	var rows []string
+
+	// Scroll indicator at top
+	if start > 0 {
+		rows = append(rows, dimRowStyle.Render(fmt.Sprintf("  ↑ %d more", start)))
+	}
+
+	for i := start; i < end; i++ {
+		item := m.pickerItems[i]
+		if i == m.pickerIdx {
+			cursor := "▶ "
+			cmdPart := selectedStyle.Render(fmt.Sprintf("%-12s", item.cmd))
+			descPart := lipgloss.NewStyle().Foreground(lipgloss.Color("14")).Render(item.desc)
+			rows = append(rows, fmt.Sprintf("%s%s  %s", cursor, cmdPart, descPart))
+		} else {
+			cursor := "  "
+			cmdPart := cmdStyle.Render(fmt.Sprintf("%-12s", item.cmd))
+			descPart := dimRowStyle.Render(item.desc)
+			rows = append(rows, fmt.Sprintf("%s%s  %s", cursor, cmdPart, descPart))
+		}
+	}
+
+	// Scroll indicator at bottom
+	remaining := total - end
+	if remaining > 0 {
+		rows = append(rows, dimRowStyle.Render(fmt.Sprintf("  ↓ %d more", remaining)))
+	}
+
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("12")).
+		Padding(0, 1).
+		Render(strings.Join(rows, "\n"))
 }
 
 // append adds raw text to the content buffer then re-renders the viewport.
