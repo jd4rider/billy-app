@@ -38,6 +38,54 @@ archives:
 checksum:
   name_template: "checksums.txt"
 
+nfpms:
+  - id: billy
+    package_name: billy
+    vendor: "jd4rider"
+    homepage: "https://github.com/jd4rider/billy-app"
+    maintainer: "jd4rider <noreply@github.com>"
+    description: "Local AI coding assistant powered by Ollama. No subscription required."
+    license: MIT
+    formats:
+      - deb
+      - rpm
+      - apk
+    bindir: /usr/bin
+    section: utils
+    priority: optional
+    meta: false
+    contents:
+      - src: README.md
+        dst: /usr/share/doc/billy/README.md
+        type: doc
+
+brews:
+  - name: billy
+    repository:
+      owner: jd4rider
+      name: homebrew-billy
+      branch: main
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    directory: Formula
+    homepage: "https://github.com/jd4rider/billy-app"
+    description: "Local AI coding assistant powered by Ollama. No subscription required."
+    license: MIT
+    test: |
+      system "#{bin}/billy", "--version"
+    install: |
+      bin.install "billy"
+
+scoops:
+  - repository:
+      owner: jd4rider
+      name: scoop-billy
+      branch: main
+      token: "{{ .Env.SCOOP_BUCKET_TOKEN }}"
+    directory: bucket
+    homepage: "https://github.com/jd4rider/billy-app"
+    description: "Local AI coding assistant powered by Ollama. No subscription required."
+    license: MIT
+
 release:
   github:
     owner: jd4rider
