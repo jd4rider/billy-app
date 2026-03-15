@@ -16,6 +16,7 @@ import (
 
 	"github.com/jonathanforrider/billy/internal/backend"
 	"github.com/jonathanforrider/billy/internal/config"
+	"github.com/jonathanforrider/billy/internal/license"
 	"github.com/jonathanforrider/billy/internal/memory"
 	"github.com/jonathanforrider/billy/internal/store"
 )
@@ -53,6 +54,7 @@ var commandList = []pickerItem{
 	{"/compact", "Summarize and compress context", false},
 	{"/help", "Show all commands", false},
 	{"/history", "Browse past conversations", false},
+	{"/license", "View or activate your Billy license key", true},
 	{"/memory", "List or manage memories", false},
 	{"/model", "List or switch Ollama models", true},
 	{"/pull", "Download a model from Ollama", true},
@@ -91,6 +93,8 @@ type ChatModel struct {
 	cfg            *config.Config
 	backend        backend.Backend
 	store          *store.Store
+	lic            *license.License // nil = free tier
+	msgCount       int              // messages sent this session (for free limit)
 	conversationID string
 	history        []backend.Message
 	content        string // raw accumulated content for the viewport
@@ -129,7 +133,7 @@ func New(cfg *config.Config, b backend.Backend, s *store.Store) ChatModel {
 	vp := viewport.New(80, 20)
 	vp.SetContent(welcome)
 
-	return ChatModel{
+	m := ChatModel{
 		cfg:      cfg,
 		backend:  b,
 		store:    s,
@@ -138,6 +142,15 @@ func New(cfg *config.Config, b backend.Backend, s *store.Store) ChatModel {
 		textarea: ta,
 		spinner:  sp,
 	}
+
+	// Load license from config if present
+	if cfg.LicenseKey != "" {
+		if lic, err := license.Parse(cfg.LicenseKey); err == nil {
+			m.lic = lic
+		}
+	}
+
+	return m
 }
 
 func (m ChatModel) Init() tea.Cmd {
@@ -231,6 +244,18 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if strings.HasPrefix(input, "/") {
 				return m.handleCommand(input)
 			}
+
+			// Freemium limits
+			if (m.lic == nil || m.lic.Free()) && m.msgCount >= 20 {
+				m.append(errorStyle.Render("⛔ Free tier limit reached (20 messages/session).\n\n") +
+					dimStyle.Render("Upgrade to Pro for unlimited conversations:\n  https://billy.sh/upgrade\n\nOr use /license <key> to activate an existing license.\n\n"))
+				m.textarea.Reset()
+				return m, nil
+			}
+			if (m.lic == nil || m.lic.Free()) && m.msgCount == 15 {
+				m.append(dimStyle.Render("⚠️  Approaching free tier limit (15/20 messages). Upgrade to Pro for unlimited: https://billy.sh/upgrade\n\n"))
+			}
+			m.msgCount++
 
 			// Natural language memory detection
 			if fact, ok := memory.DetectAndExtract(input); ok {
@@ -351,7 +376,8 @@ func (m ChatModel) View() string {
 	if m.waiting {
 		status = m.spinner.View() + dimStyle.Render(" Billy is thinking...")
 	} else {
-		status = dimStyle.Render(fmt.Sprintf(" %s · %s  — PgUp/PgDn to scroll", m.backend.Name(), m.backend.CurrentModel()))
+		badge := licenseBadge(m.lic)
+		status = dimStyle.Render(fmt.Sprintf(" %s · %s  — PgUp/PgDn to scroll", m.backend.Name(), m.backend.CurrentModel())) + " " + badge
 	}
 
 	return lipgloss.JoinVertical(
@@ -361,6 +387,25 @@ func (m ChatModel) View() string {
 		m.renderPicker(),
 		borderStyle.Width(m.width-2).Render(m.textarea.View()),
 	)
+}
+
+// licenseBadge returns a styled tier badge for the status bar.
+func licenseBadge(lic *license.License) string {
+	if lic == nil || lic.Free() {
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render("[FREE]")
+	}
+	switch lic.EffectiveTier() {
+	case license.TierPro:
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("#38bdf8")).Bold(true).Render("[PRO]")
+	case license.TierPremium:
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("#f59e0b")).Bold(true).Render("[PREMIUM]")
+	case license.TierTeam:
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("#a855f7")).Bold(true).Render("[TEAM]")
+	case license.TierEnterprise:
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("#22c55e")).Bold(true).Render("[ENTERPRISE]")
+	default:
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render("[FREE]")
+	}
 }
 
 func (m ChatModel) renderPicker() string {
@@ -515,10 +560,44 @@ func (m ChatModel) handleCommand(input string) (ChatModel, tea.Cmd) {
 	cmd := parts[0]
 
 	switch cmd {
+	case "/license":
+		if len(parts) == 1 {
+			// Show current license status
+			if m.lic == nil || m.lic.Free() {
+				m.append(dimStyle.Render("🔓 License: FREE tier\n\nLimits:\n• 20 messages per session\n• Memory not persisted between sessions\n• History limited to 5 conversations\n\nUpgrade at https://billy.sh or use /license <key> to activate.\n\n"))
+			} else {
+				expStr := "Lifetime"
+				if !m.lic.Expiry.IsZero() {
+					expStr = m.lic.Expiry.Format("Jan 2, 2006")
+				}
+				m.append(dimStyle.Render(fmt.Sprintf("✅ License: %s tier\nEmail: %s\nExpiry: %s\n\nAll features unlocked.\n\n",
+					strings.ToUpper(string(m.lic.EffectiveTier())), m.lic.Email, expStr)))
+			}
+		} else {
+			key := parts[1]
+			parsed, err := license.Parse(key)
+			if err != nil {
+				m.append(errorStyle.Render("❌ Invalid license key: "+err.Error()) + "\n\n")
+			} else if !parsed.IsActive() {
+				m.append(errorStyle.Render("❌ License key has expired.") + "\n\n")
+			} else {
+				m.lic = parsed
+				cfg := config.MustLoad()
+				cfg.LicenseKey = key
+				_ = config.Save(cfg)
+				m.append(dimStyle.Render(fmt.Sprintf("✅ License activated! Welcome to %s tier, %s 🎉\n\n",
+					strings.ToUpper(string(parsed.EffectiveTier())), parsed.Email)))
+			}
+		}
+		m.textarea.Reset()
+		return m, nil
+
 	case "/help":
 		m.append(dimStyle.Render(`
 Commands:
   /help              Show this help
+  /license           Show current license status
+  /license <key>     Activate a Billy license key
   /model             List installed models (active model highlighted)
   /model <name>      Switch to a different model
   /pull <name>       Download a new model from Ollama library

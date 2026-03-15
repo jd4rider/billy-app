@@ -29,10 +29,11 @@ type StorageConfig struct {
 }
 
 type Config struct {
-	Backend BackendConfig `toml:"backend"`
-	Ollama  OllamaConfig  `toml:"ollama"`
-	UI      UIConfig      `toml:"ui"`
-	Storage StorageConfig `toml:"storage"`
+	Backend    BackendConfig `toml:"backend"`
+	Ollama     OllamaConfig  `toml:"ollama"`
+	UI         UIConfig      `toml:"ui"`
+	Storage    StorageConfig `toml:"storage"`
+	LicenseKey string        `toml:"license_key"`
 }
 
 func DefaultConfig() *Config {
@@ -118,4 +119,12 @@ func configPath() (string, error) {
 		return "", err
 	}
 	return filepath.Join(home, ".localai", "config.toml"), nil
+}
+
+func MustLoad() *Config {
+	cfg, err := Load()
+	if err != nil {
+		return DefaultConfig()
+	}
+	return cfg
 }
