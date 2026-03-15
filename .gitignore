@@ -1,0 +1,23 @@
+# Binaries
+billy
+*.exe
+
+# Go build artifacts
+*.o
+*.a
+*.so
+
+# Test output
+*.test
+*.prof
+coverage.out
+
+# Config / secrets
+.env
+*.local
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
