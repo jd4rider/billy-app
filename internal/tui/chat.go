@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"time"
 
+	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
@@ -64,6 +64,8 @@ type ChatModel struct {
 	viewport       viewport.Model
 	textarea       textarea.Model
 	spinner        spinner.Model
+	historyMode    bool
+	historyList    list.Model
 	width          int
 	height         int
 	waiting        bool
@@ -120,10 +122,30 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.viewport.Width = msg.Width - 4
 		m.viewport.Height = msg.Height - 8
 		m.textarea.SetWidth(msg.Width - 4)
-		m.render() // re-wrap at new width
+		if m.historyMode {
+			m.historyList.SetWidth(msg.Width - 4)
+			m.historyList.SetHeight(msg.Height - 6)
+		}
+		m.render()
 		return m, nil
 
+	// ── History picker mode ──────────────────────────────────────────────
 	case tea.KeyMsg:
+		if m.historyMode {
+			switch msg.Type {
+			case tea.KeyEsc, tea.KeyCtrlC:
+				m.historyMode = false
+				return m, nil
+			case tea.KeyEnter:
+				if item, ok := m.historyList.SelectedItem().(historyItem); ok {
+					return m.loadConversation(item.conv.ID)
+				}
+				return m, nil
+			}
+			var listCmd tea.Cmd
+			m.historyList, listCmd = m.historyList.Update(msg)
+			return m, listCmd
+		}
 		switch msg.Type {
 		case tea.KeyCtrlD, tea.KeyCtrlC:
 			return m, tea.Quit
@@ -230,6 +252,11 @@ func (m ChatModel) View() string {
 		return "Loading..."
 	}
 
+	// History picker overlay
+	if m.historyMode {
+		return borderStyle.Width(m.width - 2).Render(m.historyList.View())
+	}
+
 	var status string
 	if m.waiting {
 		status = m.spinner.View() + dimStyle.Render(" Billy is thinking...")
@@ -260,6 +287,44 @@ func (m *ChatModel) render() {
 	}
 	m.viewport.SetContent(wordwrap.String(m.content, width))
 	m.viewport.GotoBottom()
+}
+
+// loadConversation restores a past conversation into the chat.
+func (m ChatModel) loadConversation(id string) (ChatModel, tea.Cmd) {
+	m.historyMode = false
+
+	if m.store == nil {
+		m.append(errorStyle.Render("No storage available.\n\n"))
+		return m, nil
+	}
+
+	msgs, err := m.store.GetMessages(id)
+	if err != nil {
+		m.append(errorStyle.Render("Failed to load conversation: "+err.Error()) + "\n\n")
+		return m, nil
+	}
+
+	// Rebuild history and viewport content
+	m.conversationID = id
+	m.history = nil
+	m.content = dimStyle.Render(fmt.Sprintf(
+		"  Billy.sh 🐐  —  Resumed conversation  ·  Model: %s\n\n",
+		m.backend.CurrentModel(),
+	))
+
+	for _, msg := range msgs {
+		m.history = append(m.history, backend.Message{Role: msg.Role, Content: msg.Content})
+		switch msg.Role {
+		case "user":
+			m.content += userStyle.Render("You") + "\n" + msg.Content + "\n\n"
+		case "assistant":
+			m.content += assistantStyle.Render("Billy") + "\n" + msg.Content + "\n\n"
+		}
+	}
+
+	m.render()
+	m.append(dimStyle.Render("── Conversation loaded. Continue from here. ──\n\n"))
+	return m, nil
 }
 
 // sendChat fires off a chat request and returns the result as a chatMsg.
@@ -310,7 +375,8 @@ Commands:
   /memory forget <id> Delete a specific memory
   /memory clear      Wipe all memories
   /save              Save this conversation
-  /history           List saved conversations
+  /history           Browse past conversations (arrow keys + Enter to load)
+  /resume <id>       Jump directly to a conversation by ID
   /clear             Clear conversation history
   /quit, /exit       Exit Billy
 
@@ -451,20 +517,20 @@ Popular models to pull:
 			if err != nil {
 				m.append(errorStyle.Render("Error: "+err.Error()) + "\n\n")
 			} else if len(convs) == 0 {
-				m.append(dimStyle.Render("No saved conversations.\n\n"))
+				m.append(dimStyle.Render("No saved conversations yet.\n\n"))
 			} else {
-				var sb strings.Builder
-				sb.WriteString("\nSaved conversations:\n")
-				for _, c := range convs {
-					sb.WriteString(fmt.Sprintf("  %s  %s  (%s)\n",
-						c.ID[:8],
-						c.Title,
-						c.UpdatedAt.Format(time.DateTime),
-					))
-				}
-				sb.WriteString("\n")
-				m.append(dimStyle.Render(sb.String()))
+				m.historyMode = true
+				m.historyList = newHistoryList(convs, m.width, m.height)
 			}
+		}
+
+	case "/resume":
+		if len(parts) < 2 {
+			m.append(errorStyle.Render("Usage: /resume <id>\n\n"))
+		} else if m.store == nil {
+			m.append(errorStyle.Render("Storage not available.\n\n"))
+		} else {
+			return m.loadConversation(parts[1])
 		}
 
 	case "/clear":
