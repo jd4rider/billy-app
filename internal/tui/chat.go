@@ -40,7 +40,12 @@ var (
 			BorderForeground(lipgloss.Color("5"))
 )
 
-// chatMsg carries a response from the backend back into the update loop.
+// pullMsg carries progress or completion back into the update loop.
+type pullMsg struct {
+	progress *backend.PullProgress // nil = done
+	err      error
+}
+
 type chatMsg struct {
 	content string
 	err     error
@@ -157,6 +162,25 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Batch(m.sendChat(), m.spinner.Tick)
 		}
 
+	case pullMsg:
+		if msg.err != nil {
+			m.waiting = false
+			m.append(errorStyle.Render("Pull failed: "+msg.err.Error()) + "\n\n")
+		} else if msg.progress == nil {
+			// Pull complete
+			m.waiting = false
+			m.append(dimStyle.Render("✅ Model downloaded successfully!\n\n"))
+		} else {
+			// Progress update — show inline, keep spinner going
+			pct := ""
+			if msg.progress.Total > 0 {
+				pct = fmt.Sprintf(" %.0f%%", float64(msg.progress.Completed)/float64(msg.progress.Total)*100)
+			}
+			// Replace last line with progress (re-append truncates content)
+			m.append(dimStyle.Render(fmt.Sprintf("  %s%s\n", msg.progress.Status, pct)))
+		}
+		return m, nil
+
 	case chatMsg:
 		m.waiting = false
 		if msg.err != nil {
@@ -236,41 +260,84 @@ func (m ChatModel) handleCommand(input string) (ChatModel, tea.Cmd) {
 	case "/help":
 		m.append(dimStyle.Render(`
 Commands:
-  /help            Show this help
-  /models          List available models
-  /model <name>    Switch to a different model
-  /save            Save this conversation
-  /clear           Clear conversation history
-  /quit, /exit     Exit Billy
+  /help              Show this help
+  /model             List installed models (with active model highlighted)
+  /model <name>      Switch to a different model
+  /pull <name>       Download a new model from Ollama library
+  /models            Alias for /model
+  /save              Save this conversation
+  /history           List saved conversations
+  /clear             Clear conversation history
+  /quit, /exit       Exit Billy
 
 Keyboard:
-  PgUp / PgDn      Scroll through conversation
-  Ctrl+D / Ctrl+C  Quit
+  PgUp / PgDn        Scroll through conversation
+  Ctrl+D / Ctrl+C    Quit
+
+Popular models to pull:
+  mistral · llama3 · codellama · phi3 · gemma · neural-chat
+  Full list: https://ollama.com/library
 
 `))
 
 	case "/models":
-		models, err := m.backend.ListModels(context.Background())
-		if err != nil {
-			m.append(errorStyle.Render("Error listing models: "+err.Error()) + "\n\n")
-		} else {
-			var sb strings.Builder
-			sb.WriteString("\nAvailable models:\n")
-			for _, mo := range models {
-				sb.WriteString(fmt.Sprintf("  • %-30s %s\n", mo.Name, dimStyle.Render(mo.Size)))
-			}
-			sb.WriteString("\n")
-			m.append(dimStyle.Render(sb.String()))
-		}
+		// Alias for /model with no args
+		return m.handleCommand("/model")
 
 	case "/model":
 		if len(parts) < 2 {
-			m.append(errorStyle.Render("Usage: /model <name>\n\n"))
+			// No argument — list available models
+			models, err := m.backend.ListModels(context.Background())
+			if err != nil {
+				m.append(errorStyle.Render("Error listing models: "+err.Error()) + "\n\n")
+			} else if len(models) == 0 {
+				m.append(dimStyle.Render("No models found. Use /pull <name> to download one.\n\n"))
+			} else {
+				var sb strings.Builder
+				sb.WriteString("\nInstalled models (use /model <name> to switch):\n")
+				for i, mo := range models {
+					active := "  "
+					if mo.Name == m.backend.CurrentModel() {
+						active = "▶ "
+					}
+					sb.WriteString(fmt.Sprintf("  %s%-32s %s\n", active, mo.Name, dimStyle.Render(mo.Size)))
+					_ = i
+				}
+				sb.WriteString("\n  Use /pull <name> to download a new model.\n\n")
+				m.append(dimStyle.Render(sb.String()))
+			}
 		} else {
 			m.backend.SetModel(parts[1])
-			m.conversationID = "" // new model = new conversation
+			m.conversationID = ""
 			m.history = nil
 			m.append(dimStyle.Render(fmt.Sprintf("Switched to model: %s\n\n", parts[1])))
+		}
+
+	case "/pull":
+		if len(parts) < 2 {
+			m.append(dimStyle.Render("Usage: /pull <model-name>\nExample: /pull mistral\n\nPopular models:\n  mistral · llama3 · codellama · phi3 · gemma · neural-chat\n\nFind more at: https://ollama.com/library\n\n"))
+		} else {
+			modelName := parts[1]
+			m.append(dimStyle.Render(fmt.Sprintf("Pulling %s from Ollama library...\n", modelName)))
+			m.waiting = true
+			b := m.backend
+			return m, tea.Batch(m.spinner.Tick, func() tea.Msg {
+				ch := make(chan backend.PullProgress, 10)
+				errCh := make(chan error, 1)
+				go func() {
+					errCh <- b.PullModel(context.Background(), modelName, ch)
+					close(ch)
+				}()
+				// Stream first progress message back
+				for p := range ch {
+					pp := p
+					return pullMsg{progress: &pp}
+				}
+				if err := <-errCh; err != nil {
+					return pullMsg{err: err}
+				}
+				return pullMsg{progress: nil}
+			})
 		}
 
 	case "/save":

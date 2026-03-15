@@ -21,10 +21,18 @@ type Model struct {
 	Size string
 }
 
+// PullProgress reports streaming progress during a model pull.
+type PullProgress struct {
+	Status    string
+	Completed int64
+	Total     int64
+}
+
 // Backend is the common interface all AI providers must implement.
 type Backend interface {
 	Chat(ctx context.Context, history []Message, opts ChatOptions) (string, error)
 	ListModels(ctx context.Context) ([]Model, error)
+	PullModel(ctx context.Context, name string, progress chan<- PullProgress) error
 	SetModel(model string)
 	CurrentModel() string
 	Name() string

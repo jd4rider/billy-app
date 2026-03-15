@@ -132,3 +132,51 @@ func (o *OllamaBackend) ListModels(ctx context.Context) ([]Model, error) {
 	}
 	return models, nil
 }
+
+// PullModel downloads a model from Ollama, streaming progress to the channel.
+func (o *OllamaBackend) PullModel(ctx context.Context, name string, progress chan<- PullProgress) error {
+	body, _ := json.Marshal(map[string]string{"name": name, "stream": "true"})
+
+	// Use a longer timeout for pulls — large models can take many minutes
+	pullClient := &http.Client{}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, o.baseURL+"/api/pull", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := pullClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("connect to Ollama: %w", err)
+	}
+	defer resp.Body.Close()
+
+	type pullLine struct {
+		Status    string `json:"status"`
+		Completed int64  `json:"completed"`
+		Total     int64  `json:"total"`
+		Error     string `json:"error"`
+	}
+
+	dec := json.NewDecoder(resp.Body)
+	for {
+		var line pullLine
+		if err := dec.Decode(&line); err != nil {
+			break
+		}
+		if line.Error != "" {
+			return fmt.Errorf("ollama pull error: %s", line.Error)
+		}
+		if progress != nil {
+			progress <- PullProgress{
+				Status:    line.Status,
+				Completed: line.Completed,
+				Total:     line.Total,
+			}
+		}
+		if line.Status == "success" {
+			break
+		}
+	}
+	return nil
+}
