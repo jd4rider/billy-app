@@ -12,6 +12,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/google/uuid"
+	"github.com/muesli/reflow/wordwrap"
 
 	"github.com/jonathanforrider/billy/internal/backend"
 	"github.com/jonathanforrider/billy/internal/config"
@@ -118,8 +119,7 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.viewport.Width = msg.Width - 4
 		m.viewport.Height = msg.Height - 8
 		m.textarea.SetWidth(msg.Width - 4)
-		m.viewport.SetContent(m.content)
-		m.viewport.GotoBottom()
+		m.render() // re-wrap at new width
 		return m, nil
 
 	case tea.KeyMsg:
@@ -229,10 +229,20 @@ func (m ChatModel) View() string {
 	)
 }
 
-// append adds text to the content buffer, updates the viewport, and scrolls to bottom.
+// append adds raw text to the content buffer then re-renders the viewport.
 func (m *ChatModel) append(text string) {
 	m.content += text
-	m.viewport.SetContent(m.content)
+	m.render()
+}
+
+// render word-wraps m.content to the current viewport width and scrolls to bottom.
+// Using muesli/reflow which is ANSI-escape-aware, so styled text wraps correctly.
+func (m *ChatModel) render() {
+	width := m.viewport.Width - 2
+	if width <= 0 {
+		width = 78
+	}
+	m.viewport.SetContent(wordwrap.String(m.content, width))
 	m.viewport.GotoBottom()
 }
 
@@ -378,7 +388,7 @@ Popular models to pull:
 			"  Billy.sh 🐐  —  Model: %s\n  Type your message and press Enter. Use /help to see commands.\n\n",
 			m.backend.CurrentModel(),
 		))
-		m.viewport.SetContent(m.content)
+		m.render()
 
 	case "/quit", "/exit":
 		return m, tea.Quit
