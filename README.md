@@ -1,8 +1,26 @@
 # Billy.sh
 
+[![Pre-Alpha](https://img.shields.io/badge/status-pre--alpha-orange?style=flat-square)](https://github.com/jd4rider/billy-app/releases)
+[![Go](https://img.shields.io/badge/Go-1.24-00ADD8?style=flat-square&logo=go)](https://go.dev)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](./LICENSE)
+
 > Your local AI coding assistant. No subscription required.
 
 **Billy.sh** is a Copilot CLI alternative powered by local [Ollama](https://ollama.com) — runs entirely on your machine, works offline, and has no recurring cost. Built with Go + [Bubble Tea](https://github.com/charmbracelet/bubbletea) for a great terminal experience.
+
+---
+
+## Built with
+
+Billy is written in **[Go](https://go.dev)** and uses the [Charm](https://charm.sh) terminal toolkit:
+
+| Library | Role |
+|---|---|
+| [Bubble Tea](https://github.com/charmbracelet/bubbletea) | TUI framework (Elm-inspired state machine) |
+| [Lipgloss](https://github.com/charmbracelet/lipgloss) | Terminal styling & layout |
+| [Glamour](https://github.com/charmbracelet/glamour) | Markdown + syntax highlighting |
+| [Bubbles](https://github.com/charmbracelet/bubbles) | UI components (viewport, spinner, list) |
+| [Ollama](https://ollama.com) | Local LLM server |
 
 ---
 
@@ -28,20 +46,30 @@
 
 ## Installation
 
-### Build from source
+### Slim (requires Ollama)
+```bash
+curl -fsSL https://raw.githubusercontent.com/jd4rider/billy-app/main/scripts/install.sh | bash
+```
+Then [install Ollama](https://ollama.com) if you haven't already.
 
+### Full (Ollama bundled — auto-starts)
+```bash
+curl -fsSL https://raw.githubusercontent.com/jd4rider/billy-app/main/scripts/install.sh | bash -s -- --full
+```
+
+### Build from source
 ```bash
 git clone https://github.com/jd4rider/billy-app.git
 cd billy-app
-go build -o billy ./cmd/billy
+go build -o billy ./cmd/billy    # slim
+# go build -tags fat -o billy-full ./cmd/billy  # fat (needs ollama_bin — see scripts/fetch-ollama.sh)
 ./billy
 ```
 
-### Install script *(coming soon)*
-
-```bash
-curl -fsSL https://billy.sh/install | bash
-```
+| Variant | Ollama | Binary size |
+|---|---|---|
+| Slim | Detect/prompt only | ~10 MB |
+| Full | Bundled + auto-starts | ~80 MB |
 
 ---
 
@@ -61,6 +89,7 @@ billy
 
 | Command | Description |
 |---|---|
+| `--version` | Print version, commit, date, and build variant |
 | `/model` | List installed Ollama models |
 | `/model <name>` | Switch to a different model |
 | `/pull <name>` | Download a new model from the Ollama library |
@@ -133,7 +162,8 @@ BILLY_MODEL=llama3 BILLY_BACKEND_URL=http://192.168.1.10:11434 billy
 | 🔜 | Groq & custom server backends |
 | 🔜 | Billy.sh cloud SaaS backend |
 | 🔜 | Voice mode (Whisper + Piper TTS) |
-| 🔜 | Bundled Ollama installer |
+| ✅ | Binary distribution (slim + fat builds) |
+| ✅ | Bundled Ollama installer |
 | 🔜 | IDE plugins (VS Code, JetBrains) |
 | 🔜 | Standalone chat app |
 | 🔜 | iPhone companion app |
@@ -148,9 +178,14 @@ billy-app/
 ├── internal/
 │   ├── backend/        # AI backend clients (Ollama, …)
 │   ├── config/         # TOML config + env var overrides
+│   ├── launcher/       # Ollama detection, start, embed (slim/fat)
 │   ├── memory/         # Memory detection & system prompt builder
 │   ├── store/          # SQLite history + memory persistence
 │   └── tui/            # Bubble Tea UI (chat view, history picker)
+├── scripts/
+│   ├── install.sh      # Installer (slim or --full)
+│   └── fetch-ollama.sh # Download ollama binary for fat CI builds
+├── .goreleaser.yml
 ├── go.mod
 └── README.md
 ```

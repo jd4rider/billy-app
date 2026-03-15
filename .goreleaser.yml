@@ -1,0 +1,71 @@
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: billy
+    binary: billy
+    main: ./cmd/billy
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      - goos: windows
+        goarch: arm64
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.ShortCommit}}
+      - -X main.date={{.Date}}
+
+archives:
+  - id: slim
+    ids: [billy]
+    name_template: "billy_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+
+checksum:
+  name_template: "checksums.txt"
+
+release:
+  github:
+    owner: jd4rider
+    name: billy-app
+  prerelease: auto
+  name_template: "{{.Tag}}"
+  header: |
+    ## ⚠️ Billy.sh {{.Tag}} — Pre-Alpha
+
+    This is pre-alpha software. Expect rough edges and breaking changes.
+
+    ### Variants
+    | Build | Ollama | Size |
+    |---|---|---|
+    | `billy_*` (slim) | Requires separate Ollama install | ~10 MB |
+    | `billy-full_*` (full) | Ollama bundled, auto-starts | ~80 MB |
+
+    ### Quick Install (slim)
+    ```bash
+    curl -fsSL https://raw.githubusercontent.com/jd4rider/billy-app/main/scripts/install.sh | bash
+    ```
+
+    After installing, run `ollama pull mistral` to download your first model.
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^chore:"
+      - "^test:"

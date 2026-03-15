@@ -1,6 +1,10 @@
 # Binaries
-billy
+/billy
+/billy-full
 *.exe
+
+# Fat build - downloaded at build time
+internal/launcher/ollama_bin
 
 # Go build artifacts
 *.o
@@ -21,4 +25,3 @@ coverage.out
 
 # IDE
 .idea/
-billy
