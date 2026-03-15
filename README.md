@@ -294,7 +294,7 @@ BILLY_MODEL=llama3 BILLY_BACKEND_URL=http://192.168.1.10:11434 billy
 | ✅ | Homebrew tap, Scoop bucket, .deb/.rpm/.apk packages |
 | ✅ | [billy.sh](https://jd4rider.github.io/billy-web) landing page live |
 | ✅ | [Starlight docs site](https://jd4rider.github.io/billy-starlight) |
-| 🔄 | One-shot CLI mode (`billy "prompt"`, `billy read/explain/fix/run`) |
+| ✅ | One-shot CLI mode (`billy "prompt"`, `billy read/explain/fix/run`) |
 | 🔄 | Context compaction (`/compact`) |
 | 🔄 | Session checkpoints (`/session`) |
 | 🔜 | Teaching mode (`/mode teach`) + admin controls |
