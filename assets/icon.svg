@@ -1,0 +1,85 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0d1117"/>
+      <stop offset="100%" stop-color="#1c2128"/>
+    </linearGradient>
+    <linearGradient id="hornGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#38bdf8"/>
+      <stop offset="100%" stop-color="#0ea5e9"/>
+    </linearGradient>
+    <linearGradient id="faceGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#f8fafc"/>
+      <stop offset="100%" stop-color="#e2e8f0"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Background rounded square -->
+  <rect width="512" height="512" rx="100" fill="url(#bg)"/>
+
+  <!-- ── Ears (behind head) ── -->
+  <ellipse cx="148" cy="268" rx="36" ry="22" fill="#e2e8f0" transform="rotate(-30 148 268)"/>
+  <ellipse cx="364" cy="268" rx="36" ry="22" fill="#e2e8f0" transform="rotate(30 364 268)"/>
+  <!-- Inner ear -->
+  <ellipse cx="148" cy="268" rx="22" ry="13" fill="#fda4af" transform="rotate(-30 148 268)"/>
+  <ellipse cx="364" cy="268" rx="22" ry="13" fill="#fda4af" transform="rotate(30 364 268)"/>
+
+  <!-- ── Left horn ── -->
+  <!-- Thick curved horn: starts at top-left of head, sweeps left then up to a point -->
+  <path d="M 200 192
+           C 182 168, 148 138, 148 92
+           C 148 68, 164 56, 178 64
+           C 164 84, 168 118, 188 152
+           C 200 172, 210 184, 214 196 Z"
+        fill="url(#hornGrad)"/>
+
+  <!-- ── Right horn ── -->
+  <path d="M 312 192
+           C 330 168, 364 138, 364 92
+           C 364 68, 348 56, 334 64
+           C 348 84, 344 118, 324 152
+           C 312 172, 302 184, 298 196 Z"
+        fill="url(#hornGrad)"/>
+
+  <!-- ── Head ── -->
+  <rect x="172" y="180" width="168" height="210" rx="48" fill="url(#faceGrad)"/>
+
+  <!-- ── Eyes ── -->
+  <!-- Sclera -->
+  <ellipse cx="222" cy="272" rx="30" ry="22" fill="#fffbeb"/>
+  <ellipse cx="290" cy="272" rx="30" ry="22" fill="#fffbeb"/>
+  <!-- Iris (golden-amber — characteristic goat colour) -->
+  <ellipse cx="222" cy="272" rx="22" ry="17" fill="#d97706"/>
+  <ellipse cx="290" cy="272" rx="22" ry="17" fill="#d97706"/>
+  <!-- Horizontal slit pupil (the defining goat feature) -->
+  <rect x="206" y="268" width="32" height="8" rx="4" fill="#1a0500"/>
+  <rect x="274" y="268" width="32" height="8" rx="4" fill="#1a0500"/>
+  <!-- Eye shine -->
+  <circle cx="230" cy="266" r="5" fill="rgba(255,255,255,0.55)"/>
+  <circle cx="298" cy="266" r="5" fill="rgba(255,255,255,0.55)"/>
+
+  <!-- ── Snout / muzzle ── -->
+  <ellipse cx="256" cy="338" rx="50" ry="36" fill="#dde4f0"/>
+  <!-- Nostrils -->
+  <ellipse cx="241" cy="344" rx="9" ry="7" fill="#94a3b8"/>
+  <ellipse cx="271" cy="344" rx="9" ry="7" fill="#94a3b8"/>
+
+  <!-- ── Goatee (classic billy goat beard) ── -->
+  <path d="M 236 388
+           C 236 390, 242 418, 248 434
+           C 252 446, 256 452, 256 452
+           C 256 452, 260 446, 264 434
+           C 270 418, 276 390, 276 388
+           Q 264 394, 256 394
+           Q 248 394, 236 388 Z"
+        fill="#dde4f0"/>
+
+  <!-- ── Brand mark: $_ at bottom ── -->
+  <text x="256" y="492"
+        text-anchor="middle"
+        font-family="ui-monospace, 'SF Mono', 'Cascadia Code', monospace"
+        font-size="40"
+        font-weight="700"
+        letter-spacing="2"
+        fill="#38bdf8">$_</text>
+</svg>
