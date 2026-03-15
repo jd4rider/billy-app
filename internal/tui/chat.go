@@ -16,6 +16,7 @@ import (
 
 	"github.com/jonathanforrider/billy/internal/backend"
 	"github.com/jonathanforrider/billy/internal/config"
+	"github.com/jonathanforrider/billy/internal/memory"
 	"github.com/jonathanforrider/billy/internal/store"
 )
 
@@ -140,6 +141,21 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m.handleCommand(input)
 			}
 
+			// Natural language memory detection
+			if fact, ok := memory.DetectAndExtract(input); ok {
+				if m.store != nil {
+					if err := m.store.SaveMemory(uuid.New().String(), fact); err == nil {
+						m.append(assistantStyle.Render("Billy") + "\n" +
+							dimStyle.Render(fmt.Sprintf("Got it! I'll remember: \"%s\"\n", fact)) + "\n")
+					} else {
+						m.append(errorStyle.Render("Couldn't save memory: "+err.Error()) + "\n\n")
+					}
+				} else {
+					m.append(dimStyle.Render("(Memory not available — no storage)\n\n"))
+				}
+				return m, nil
+			}
+
 			// Ensure a conversation exists in the store
 			if m.store != nil && m.conversationID == "" {
 				m.conversationID = uuid.New().String()
@@ -247,16 +263,31 @@ func (m *ChatModel) render() {
 }
 
 // sendChat fires off a chat request and returns the result as a chatMsg.
+// It prepends a system prompt built from memories before sending history.
 func (m ChatModel) sendChat() tea.Cmd {
-	history := make([]backend.Message, len(m.history))
-	copy(history, m.history)
+	// Build system prompt from memories
+	var memTexts []string
+	if m.store != nil {
+		if mems, err := m.store.ListMemories(); err == nil {
+			for _, mem := range mems {
+				memTexts = append(memTexts, mem.Content)
+			}
+		}
+	}
+	systemPrompt := memory.BuildSystemPrompt(memTexts)
+
+	// Prepend system message to history for this request
+	fullHistory := make([]backend.Message, 0, len(m.history)+1)
+	fullHistory = append(fullHistory, backend.Message{Role: "system", Content: systemPrompt})
+	fullHistory = append(fullHistory, m.history...)
+
 	opts := backend.ChatOptions{
 		Temperature: m.cfg.Ollama.Temperature,
 		NumPredict:  m.cfg.Ollama.NumPredict,
 	}
 	b := m.backend
 	return func() tea.Msg {
-		content, err := b.Chat(context.Background(), history, opts)
+		content, err := b.Chat(context.Background(), fullHistory, opts)
 		return chatMsg{content: content, err: err}
 	}
 }
@@ -271,17 +302,25 @@ func (m ChatModel) handleCommand(input string) (ChatModel, tea.Cmd) {
 		m.append(dimStyle.Render(`
 Commands:
   /help              Show this help
-  /model             List installed models (with active model highlighted)
+  /model             List installed models (active model highlighted)
   /model <name>      Switch to a different model
   /pull <name>       Download a new model from Ollama library
   /models            Alias for /model
+  /memory            List everything Billy remembers about you
+  /memory forget <id> Delete a specific memory
+  /memory clear      Wipe all memories
   /save              Save this conversation
   /history           List saved conversations
   /clear             Clear conversation history
   /quit, /exit       Exit Billy
 
+Natural language memory:
+  "Remember that I prefer Go over Python"
+  "Note that my name is Jonathan"
+  "Don't forget I'm building Billy.sh"
+
 Keyboard:
-  PgUp / PgDn        Scroll through conversation
+  PgUp / PgDn        Scroll conversation
   Ctrl+D / Ctrl+C    Quit
 
 Popular models to pull:
@@ -293,6 +332,53 @@ Popular models to pull:
 	case "/models":
 		// Alias for /model with no args
 		return m.handleCommand("/model")
+
+	case "/memory":
+		if m.store == nil {
+			m.append(errorStyle.Render("Memory not available (no storage).\n\n"))
+			break
+		}
+		subCmd := ""
+		if len(parts) > 1 {
+			subCmd = parts[1]
+		}
+		switch subCmd {
+		case "forget":
+			if len(parts) < 3 {
+				m.append(errorStyle.Render("Usage: /memory forget <id>\n\n"))
+			} else {
+				ok, err := m.store.ForgetMemory(parts[2])
+				if err != nil {
+					m.append(errorStyle.Render("Error: "+err.Error()) + "\n\n")
+				} else if !ok {
+					m.append(dimStyle.Render(fmt.Sprintf("No memory found with id starting with '%s'\n\n", parts[2])))
+				} else {
+					m.append(dimStyle.Render("Memory forgotten.\n\n"))
+				}
+			}
+		case "clear":
+			if err := m.store.ClearMemories(); err != nil {
+				m.append(errorStyle.Render("Error: "+err.Error()) + "\n\n")
+			} else {
+				m.append(dimStyle.Render("All memories cleared.\n\n"))
+			}
+		default:
+			// List memories
+			mems, err := m.store.ListMemories()
+			if err != nil {
+				m.append(errorStyle.Render("Error loading memories: "+err.Error()) + "\n\n")
+			} else if len(mems) == 0 {
+				m.append(dimStyle.Render("No memories yet. Tell me things like:\n  \"Remember that I prefer Go over Python\"\n\n"))
+			} else {
+				var sb strings.Builder
+				sb.WriteString(fmt.Sprintf("\n🧠 Billy remembers %d thing(s) about you:\n\n", len(mems)))
+				for _, mem := range mems {
+					sb.WriteString(fmt.Sprintf("  [%s]  %s\n", mem.ID[:8], mem.Content))
+				}
+				sb.WriteString("\nUse /memory forget <id> to remove one.\n\n")
+				m.append(dimStyle.Render(sb.String()))
+			}
+		}
 
 	case "/model":
 		if len(parts) < 2 {

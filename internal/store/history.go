@@ -66,6 +66,10 @@ func New(path string) (*Store, error) {
 		return nil, err
 	}
 
+	if err := initMemories(db); err != nil {
+		return nil, err
+	}
+
 	return &Store{db: db}, nil
 }
 
