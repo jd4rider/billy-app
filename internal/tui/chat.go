@@ -94,6 +94,25 @@ type chatMsg struct {
 	err     error
 }
 
+type compactMsg struct {
+	summary string
+}
+
+type checkpointMsg struct {
+	name    string
+	summary string
+	err     error
+}
+
+// estimateTokens gives a rough token count for the history (4 chars ≈ 1 token).
+func estimateTokens(history []backend.Message) int {
+	total := 0
+	for _, m := range history {
+		total += len(m.Content) / 4
+	}
+	return total
+}
+
 // ChatModel is the Bubble Tea model for the main chat interface.
 type ChatModel struct {
 	cfg            *config.Config
@@ -120,6 +139,8 @@ type ChatModel struct {
 	shellAlways    map[string]bool // session-level "always run" prefixes
 	cmdQueue       []string        // AI-suggested commands pending permission
 	agentMode      bool            // true = agentic (default), false = chat only
+	tokenEstimate  int             // rough token count for current history
+	compacted      bool            // true if history has been compacted
 }
 
 // New creates a new ChatModel.
@@ -350,6 +371,7 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 			m.history = append(m.history, backend.Message{Role: "user", Content: input})
+			m.tokenEstimate = estimateTokens(m.history)
 			m.append(userStyle.Render("You") + "\n" + input + "\n\n")
 
 			// Persist user message
@@ -386,6 +408,7 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.append(errorStyle.Render("Error: "+msg.err.Error()) + "\n\n")
 		} else {
 			m.history = append(m.history, backend.Message{Role: "assistant", Content: msg.content})
+			m.tokenEstimate = estimateTokens(m.history)
 			m.append(assistantStyle.Render("Billy") + "\n" + msg.content + "\n\n")
 
 			// Persist assistant message
@@ -408,6 +431,29 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.waiting {
 			m.spinner, spCmd = m.spinner.Update(msg)
 			return m, spCmd
+		}
+		return m, nil
+
+	case compactMsg:
+		m.waiting = false
+		keep := m.history
+		if len(keep) > 6 {
+			keep = keep[len(keep)-6:]
+		}
+		m.history = append([]backend.Message{
+			{Role: "system", Content: "Previous conversation summary: " + msg.summary},
+		}, keep...)
+		m.compacted = true
+		m.tokenEstimate = estimateTokens(m.history)
+		m.append(dimStyle.Render(fmt.Sprintf("✅ Compacted! Summary:\n\n%s\n\n── Continuing from here ──\n\n", msg.summary)))
+		return m, nil
+
+	case checkpointMsg:
+		m.waiting = false
+		if msg.err != nil {
+			m.append(errorStyle.Render("Checkpoint failed: " + msg.err.Error() + "\n\n"))
+		} else {
+			m.append(dimStyle.Render(fmt.Sprintf("✅ Checkpoint '%s' saved!\n\nSummary: %s\n\n", msg.name, msg.summary)))
 		}
 		return m, nil
 	}
@@ -458,6 +504,9 @@ func (m ChatModel) View() string {
 			modeBadge = dimStyle.Render("[CHAT]")
 		}
 		status = dimStyle.Render(fmt.Sprintf(" %s · %s  — PgUp/PgDn to scroll", m.backend.Name(), m.backend.CurrentModel())) + " " + modeBadge + " " + badge
+		if m.tokenEstimate > 3072 {
+			status += " " + lipgloss.NewStyle().Foreground(lipgloss.Color("#f59e0b")).Render(fmt.Sprintf("[~%dk tokens]", m.tokenEstimate/1000))
+		}
 	}
 
 	return lipgloss.JoinVertical(
@@ -725,6 +774,10 @@ Commands:
   /save              Save this conversation
   /history           Browse past conversations (arrow keys + Enter to load)
   /resume <id>       Jump directly to a conversation by ID
+  /compact           Summarize and compress conversation context
+  /session           Save a session checkpoint (with AI summary)
+  /session list      List all saved checkpoints
+  /session load <n>  Restore a checkpoint by name
   /clear             Clear conversation history
   /quit, /exit       Exit Billy
 
@@ -897,11 +950,141 @@ Popular models to pull:
 	case "/quit", "/exit":
 		return m, tea.Quit
 
+	case "/compact":
+		if len(m.history) == 0 {
+			m.append(dimStyle.Render("Nothing to compact yet.\n\n"))
+			m.textarea.Reset()
+			return m, nil
+		}
+		m.append(dimStyle.Render("🗜  Compacting conversation... asking Billy to summarize...\n\n"))
+		m.waiting = true
+		m.textarea.Reset()
+		return m, tea.Batch(m.spinner.Tick, m.compactHistory())
+
+	case "/session":
+		subArgs := parts[1:]
+		if len(subArgs) == 0 || subArgs[0] == "save" {
+			if m.store == nil {
+				m.append(errorStyle.Render("Storage not available.\n\n"))
+				m.textarea.Reset()
+				return m, nil
+			}
+			name := fmt.Sprintf("checkpoint-%s", time.Now().Format("2006-01-02-15:04"))
+			if len(subArgs) > 1 {
+				name = strings.Join(subArgs[1:], "-")
+			}
+			m.append(dimStyle.Render("💾 Saving checkpoint... generating summary...\n\n"))
+			m.waiting = true
+			m.textarea.Reset()
+			return m, tea.Batch(m.spinner.Tick, m.saveCheckpoint(name))
+		}
+		switch subArgs[0] {
+		case "list":
+			if m.store == nil {
+				m.append(errorStyle.Render("Storage not available.\n\n"))
+				break
+			}
+			checkpoints, err := m.store.AllCheckpoints()
+			if err != nil || len(checkpoints) == 0 {
+				m.append(dimStyle.Render("No checkpoints saved yet. Use /session to create one.\n\n"))
+				break
+			}
+			var sb strings.Builder
+			sb.WriteString("Session checkpoints:\n\n")
+			for _, cp := range checkpoints {
+				sb.WriteString(fmt.Sprintf("  %-30s  %s  (%d msgs)\n", cp.Name, cp.CreatedAt.Format("Jan 2 15:04"), cp.MessageCount))
+			}
+			sb.WriteString("\nUse: /session load <name>\n\n")
+			m.append(dimStyle.Render(sb.String()))
+		case "load":
+			if len(subArgs) < 2 {
+				m.append(errorStyle.Render("Usage: /session load <name>\n\n"))
+				break
+			}
+			if m.store == nil {
+				m.append(errorStyle.Render("Storage not available.\n\n"))
+				break
+			}
+			cpName := strings.Join(subArgs[1:], "-")
+			cp, err := m.store.GetCheckpointByName(cpName)
+			if err != nil || cp == nil {
+				m.append(errorStyle.Render(fmt.Sprintf("Checkpoint '%s' not found.\n\n", cpName)))
+				break
+			}
+			m.history = []backend.Message{
+				{Role: "system", Content: "Session checkpoint summary: " + cp.Summary},
+			}
+			m.compacted = true
+			m.tokenEstimate = estimateTokens(m.history)
+			m.append(dimStyle.Render(fmt.Sprintf("✅ Loaded checkpoint '%s'\n\nSummary: %s\n\n── Continuing from checkpoint ──\n\n", cp.Name, cp.Summary)))
+		default:
+			m.append(errorStyle.Render(fmt.Sprintf("Unknown /session subcommand: %s\nUsage: /session [save|list|load <name>]\n\n", subArgs[0])))
+		}
+		m.textarea.Reset()
+		return m, nil
+
 	default:
 		m.append(errorStyle.Render(fmt.Sprintf("Unknown command: %s  (try /help)\n\n", cmd)))
 	}
 
 	return m, nil
+}
+
+// compactHistory asks the model to summarize the conversation, then replaces
+// history with [summary-system-msg] + last 6 messages.
+func (m ChatModel) compactHistory() tea.Cmd {
+	msgs := make([]backend.Message, len(m.history))
+	copy(msgs, m.history)
+	b := m.backend
+	convID := m.conversationID
+	s := m.store
+	return func() tea.Msg {
+		var sb strings.Builder
+		sb.WriteString("Summarize the following conversation concisely. Focus on: decisions made, code written, problems solved, context the user wants remembered. Output only the summary, no preamble.\n\n")
+		for _, msg := range msgs {
+			sb.WriteString(fmt.Sprintf("[%s]: %s\n\n", msg.Role, msg.Content))
+		}
+		summary, err := b.Chat(context.Background(), []backend.Message{
+			{Role: "user", Content: sb.String()},
+		}, backend.ChatOptions{Temperature: 0.3, NumPredict: 512})
+		if err != nil {
+			return chatMsg{err: fmt.Errorf("compact failed: %w", err)}
+		}
+		if s != nil && convID != "" {
+			_ = s.UpdateCompactedSummary(convID, summary)
+		}
+		return compactMsg{summary: summary}
+	}
+}
+
+// saveCheckpoint asks the model for a thorough summary and persists it as a named checkpoint.
+func (m ChatModel) saveCheckpoint(name string) tea.Cmd {
+	msgs := make([]backend.Message, len(m.history))
+	copy(msgs, m.history)
+	b := m.backend
+	s := m.store
+	convID := m.conversationID
+	msgCount := len(msgs)
+	return func() tea.Msg {
+		var sb strings.Builder
+		sb.WriteString("Summarize this conversation for a session checkpoint. Be thorough — this summary will be used to restore context later. Include: what was built, key decisions, current state, and what to do next.\n\n")
+		for _, msg := range msgs {
+			sb.WriteString(fmt.Sprintf("[%s]: %s\n\n", msg.Role, msg.Content))
+		}
+		summary, err := b.Chat(context.Background(), []backend.Message{
+			{Role: "user", Content: sb.String()},
+		}, backend.ChatOptions{Temperature: 0.3, NumPredict: 1024})
+		if err != nil {
+			return checkpointMsg{err: fmt.Errorf("checkpoint failed: %w", err)}
+		}
+		if s != nil {
+			_ = s.SaveCheckpoint(
+				fmt.Sprintf("cp-%d", time.Now().UnixNano()),
+				convID, name, summary, msgCount,
+			)
+		}
+		return checkpointMsg{name: name, summary: summary}
+	}
 }
 
 // activateLicense validates the given key, encrypts it, and saves it to SQLite.

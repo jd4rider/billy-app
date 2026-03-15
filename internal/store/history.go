@@ -11,11 +11,12 @@ import (
 
 const schema = `
 CREATE TABLE IF NOT EXISTS conversations (
-	id         TEXT PRIMARY KEY,
-	title      TEXT NOT NULL,
-	model      TEXT NOT NULL,
-	created_at TIMESTAMP NOT NULL,
-	updated_at TIMESTAMP NOT NULL
+	id                TEXT PRIMARY KEY,
+	title             TEXT NOT NULL,
+	model             TEXT NOT NULL,
+	compacted_summary TEXT NOT NULL DEFAULT '',
+	created_at        TIMESTAMP NOT NULL,
+	updated_at        TIMESTAMP NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -66,11 +67,18 @@ func New(path string) (*Store, error) {
 		return nil, err
 	}
 
+	// Migration: add compacted_summary to existing DBs that predate this column.
+	_, _ = db.Exec(`ALTER TABLE conversations ADD COLUMN compacted_summary TEXT NOT NULL DEFAULT ''`)
+
 	if err := initMemories(db); err != nil {
 		return nil, err
 	}
 
 	if err := initKV(db); err != nil {
+		return nil, err
+	}
+
+	if err := initCheckpoints(db); err != nil {
 		return nil, err
 	}
 
@@ -149,4 +157,17 @@ func (s *Store) ListConversations() ([]Conversation, error) {
 		convs = append(convs, c)
 	}
 	return convs, rows.Err()
+}
+
+// UpdateCompactedSummary persists the compacted summary for a conversation.
+func (s *Store) UpdateCompactedSummary(convID, summary string) error {
+	_, err := s.db.Exec(`UPDATE conversations SET compacted_summary = ? WHERE id = ?`, summary, convID)
+	return err
+}
+
+// GetCompactedSummary retrieves the compacted summary for a conversation.
+func (s *Store) GetCompactedSummary(convID string) (string, error) {
+	var summary string
+	err := s.db.QueryRow(`SELECT compacted_summary FROM conversations WHERE id = ?`, convID).Scan(&summary)
+	return summary, err
 }
