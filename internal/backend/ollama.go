@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -23,6 +24,21 @@ func NewOllama(baseURL, model string) *OllamaBackend {
 		model:   model,
 		client:  &http.Client{Timeout: 120 * time.Second},
 	}
+}
+
+// Ping checks whether Ollama is reachable. Returns a friendly error if not.
+func (o *OllamaBackend) Ping(ctx context.Context) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, o.baseURL, nil)
+	if err != nil {
+		return classifyError(err, o.baseURL, o.model)
+	}
+	pingClient := &http.Client{Timeout: 3 * time.Second}
+	resp, err := pingClient.Do(req)
+	if err != nil {
+		return classifyError(err, o.baseURL, o.model)
+	}
+	resp.Body.Close()
+	return nil
 }
 
 func (o *OllamaBackend) Name() string         { return "ollama" }
@@ -82,17 +98,17 @@ func (o *OllamaBackend) Chat(ctx context.Context, history []Message, opts ChatOp
 
 	resp, err := o.client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("connect to Ollama at %s: %w\n\nMake sure Ollama is running: ollama serve", o.baseURL, err)
+		return "", classifyError(err, o.baseURL, o.model)
 	}
 	defer resp.Body.Close()
 
 	var result ollamaChatResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", fmt.Errorf("decode response: %w", err)
+		return "", &BillyError{Message: "Unexpected response from Ollama", Hint: "Check that Ollama is up to date"}
 	}
 
 	if result.Error != "" {
-		return "", fmt.Errorf("ollama error: %s", result.Error)
+		return "", classifyError(errors.New(result.Error), o.baseURL, o.model)
 	}
 
 	return result.Message.Content, nil
@@ -114,13 +130,13 @@ func (o *OllamaBackend) ListModels(ctx context.Context) ([]Model, error) {
 
 	resp, err := o.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("connect to Ollama at %s: %w", o.baseURL, err)
+		return nil, classifyError(err, o.baseURL, o.model)
 	}
 	defer resp.Body.Close()
 
 	var result ollamaModelsResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, err
+		return nil, &BillyError{Message: "Unexpected response from Ollama", Hint: "Check that Ollama is up to date"}
 	}
 
 	models := make([]Model, len(result.Models))
