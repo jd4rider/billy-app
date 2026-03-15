@@ -70,6 +70,10 @@ func New(path string) (*Store, error) {
 		return nil, err
 	}
 
+	if err := initKV(db); err != nil {
+		return nil, err
+	}
+
 	return &Store{db: db}, nil
 }
 

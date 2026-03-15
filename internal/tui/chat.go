@@ -1,9 +1,12 @@
 package tui
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/spinner"
@@ -50,16 +53,19 @@ type pickerItem struct {
 }
 
 var commandList = []pickerItem{
+	{"/activate", "Activate a Billy license key (prompts for key)", false},
 	{"/clear", "Clear the current chat", false},
 	{"/compact", "Summarize and compress context", false},
 	{"/help", "Show all commands", false},
 	{"/history", "Browse past conversations", false},
-	{"/license", "View or activate your Billy license key", true},
+	{"/license", "Show current license / tier status", false},
 	{"/memory", "List or manage memories", false},
+	{"/mode", "Switch between agent and chat mode", true},
 	{"/model", "List or switch Ollama models", true},
 	{"/pull", "Download a model from Ollama", true},
 	{"/quit", "Exit Billy", false},
 	{"/resume", "Load a past conversation by ID", true},
+	{"/run", "Run a shell command (with permission prompt)", true},
 	{"/save", "Save current conversation", false},
 	{"/session", "Save a session checkpoint", false},
 }
@@ -109,6 +115,11 @@ type ChatModel struct {
 	showPicker     bool
 	pickerItems    []pickerItem
 	pickerIdx      int
+	activating     bool            // true while /activate key-entry prompt is shown
+	shellPending   string          // shell command awaiting user permission
+	shellAlways    map[string]bool // session-level "always run" prefixes
+	cmdQueue       []string        // AI-suggested commands pending permission
+	agentMode      bool            // true = agentic (default), false = chat only
 }
 
 // New creates a new ChatModel.
@@ -134,17 +145,26 @@ func New(cfg *config.Config, b backend.Backend, s *store.Store) ChatModel {
 	vp.SetContent(welcome)
 
 	m := ChatModel{
-		cfg:      cfg,
-		backend:  b,
-		store:    s,
-		content:  welcome,
-		viewport: vp,
-		textarea: ta,
-		spinner:  sp,
+		cfg:         cfg,
+		backend:     b,
+		store:       s,
+		content:     welcome,
+		viewport:    vp,
+		textarea:    ta,
+		spinner:     sp,
+		shellAlways: make(map[string]bool),
+		agentMode:   true, // agentic by default
 	}
 
-	// Load license from config if present
-	if cfg.LicenseKey != "" {
+	// Load license — SQLite encrypted store takes priority, config.toml is fallback
+	if s != nil {
+		if keyBytes, err := s.GetEncrypted("license_key"); err == nil && len(keyBytes) > 0 {
+			if lic, err := license.Parse(string(keyBytes)); err == nil {
+				m.lic = lic
+			}
+		}
+	}
+	if m.lic == nil && cfg.LicenseKey != "" {
 		if lic, err := license.Parse(cfg.LicenseKey); err == nil {
 			m.lic = lic
 		}
@@ -195,6 +215,53 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.historyList, listCmd = m.historyList.Update(msg)
 			return m, listCmd
 		}
+
+	// ── /activate key-entry mode ─────────────────────────────────────────
+	if m.activating {
+		switch msg.Type {
+		case tea.KeyEsc, tea.KeyCtrlC:
+			m.activating = false
+			m.textarea.Placeholder = "Ask Billy anything... (Enter to send, Ctrl+D to quit)"
+			m.textarea.Reset()
+			m.append(dimStyle.Render("Activation cancelled.\n\n"))
+			return m, nil
+		case tea.KeyEnter:
+			key := strings.TrimSpace(m.textarea.Value())
+			m.activating = false
+			m.textarea.Placeholder = "Ask Billy anything... (Enter to send, Ctrl+D to quit)"
+			m.textarea.Reset()
+			return m.activateLicense(key), nil
+		}
+		m.textarea, taCmd = m.textarea.Update(msg)
+		return m, taCmd
+	}
+
+	// ── Shell permission response ────────────────────────────────────────
+	if m.shellPending != "" && msg.Type == tea.KeyEnter {
+		resp := strings.ToLower(strings.TrimSpace(m.textarea.Value()))
+		pending := m.shellPending
+		m.shellPending = ""
+		switch resp {
+		case "y", "yes", "": // bare Enter = yes
+			m = m.executeShell(pending)
+		case "a", "always":
+			prefix := strings.Fields(pending)[0]
+			m.shellAlways[prefix] = true
+			m = m.executeShell(pending)
+		default: // n, no, skip, s
+			m.textarea.Placeholder = "Ask Billy anything... (Enter to send, Ctrl+D to quit)"
+			m.textarea.Reset()
+			m.append(dimStyle.Render("Skipped.\n\n"))
+			m.cmdQueue = nil // cancel rest of queue on explicit no
+		}
+		// Process next queued command if any
+		if len(m.cmdQueue) > 0 {
+			m = m.promptNextQueuedCmd()
+		} else {
+			m.textarea.Placeholder = "Ask Billy anything... (Enter to send, Ctrl+D to quit)"
+		}
+		return m, nil
+	}
 	// Command picker navigation — intercepts keys when picker is visible
 	if m.showPicker && len(m.pickerItems) > 0 {
 		switch msg.Type {
@@ -325,6 +392,15 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.store != nil && m.conversationID != "" {
 				_ = m.store.AddMessage(uuid.New().String(), m.conversationID, "assistant", msg.content)
 			}
+
+			// In agent mode, detect shell commands and queue them for permission
+			if m.agentMode {
+				cmds := extractShellCommands(msg.content)
+				if len(cmds) > 0 {
+					m.cmdQueue = append(m.cmdQueue, cmds...)
+					m = m.promptNextQueuedCmd()
+				}
+			}
 		}
 		return m, nil
 
@@ -377,7 +453,11 @@ func (m ChatModel) View() string {
 		status = m.spinner.View() + dimStyle.Render(" Billy is thinking...")
 	} else {
 		badge := licenseBadge(m.lic)
-		status = dimStyle.Render(fmt.Sprintf(" %s · %s  — PgUp/PgDn to scroll", m.backend.Name(), m.backend.CurrentModel())) + " " + badge
+		modeBadge := lipgloss.NewStyle().Foreground(lipgloss.Color("#38bdf8")).Bold(true).Render("[AGENT]")
+		if !m.agentMode {
+			modeBadge = dimStyle.Render("[CHAT]")
+		}
+		status = dimStyle.Render(fmt.Sprintf(" %s · %s  — PgUp/PgDn to scroll", m.backend.Name(), m.backend.CurrentModel())) + " " + modeBadge + " " + badge
 	}
 
 	return lipgloss.JoinVertical(
@@ -537,6 +617,9 @@ func (m ChatModel) sendChat() tea.Cmd {
 		}
 	}
 	systemPrompt := memory.BuildSystemPrompt(memTexts)
+	if m.agentMode {
+		systemPrompt = agentSystemPrompt + "\n\n" + systemPrompt
+	}
 
 	// Prepend system message to history for this request
 	fullHistory := make([]backend.Message, 0, len(m.history)+1)
@@ -560,44 +643,77 @@ func (m ChatModel) handleCommand(input string) (ChatModel, tea.Cmd) {
 	cmd := parts[0]
 
 	switch cmd {
+	case "/activate":
+		// Enter activation mode — intercept next Enter in Update()
+		m.activating = true
+		m.textarea.Reset()
+		m.textarea.Placeholder = "Paste your BILLY-xxx license key and press Enter (Esc to cancel)..."
+		m.append(dimStyle.Render("🔑 Enter your license key below and press Enter:\n\n"))
+		return m, nil
+
 	case "/license":
-		if len(parts) == 1 {
-			// Show current license status
-			if m.lic == nil || m.lic.Free() {
-				m.append(dimStyle.Render("🔓 License: FREE tier\n\nLimits:\n• 20 messages per session\n• Memory not persisted between sessions\n• History limited to 5 conversations\n\nUpgrade at https://billy.sh or use /license <key> to activate.\n\n"))
-			} else {
-				expStr := "Lifetime"
-				if !m.lic.Expiry.IsZero() {
-					expStr = m.lic.Expiry.Format("Jan 2, 2006")
-				}
-				m.append(dimStyle.Render(fmt.Sprintf("✅ License: %s tier\nEmail: %s\nExpiry: %s\n\nAll features unlocked.\n\n",
-					strings.ToUpper(string(m.lic.EffectiveTier())), m.lic.Email, expStr)))
-			}
+		// Show tier status only (activation is via /activate)
+		if m.lic == nil || m.lic.Free() {
+			m.append(dimStyle.Render("🔓 License: FREE tier\n\nLimits:\n• 20 messages per session\n• Memory not persisted between sessions\n• History limited to 5 conversations\n\nUpgrade at https://billy.sh\nUse /activate to enter a license key.\n\n"))
 		} else {
-			key := parts[1]
-			parsed, err := license.Parse(key)
-			if err != nil {
-				m.append(errorStyle.Render("❌ Invalid license key: "+err.Error()) + "\n\n")
-			} else if !parsed.IsActive() {
-				m.append(errorStyle.Render("❌ License key has expired.") + "\n\n")
-			} else {
-				m.lic = parsed
-				cfg := config.MustLoad()
-				cfg.LicenseKey = key
-				_ = config.Save(cfg)
-				m.append(dimStyle.Render(fmt.Sprintf("✅ License activated! Welcome to %s tier, %s 🎉\n\n",
-					strings.ToUpper(string(parsed.EffectiveTier())), parsed.Email)))
+			expStr := "Lifetime"
+			if !m.lic.Expiry.IsZero() {
+				expStr = m.lic.Expiry.Format("Jan 2, 2006")
+			}
+			seatsStr := ""
+			if m.lic.Seats > 0 {
+				seatsStr = fmt.Sprintf("\nSeats: %d", m.lic.Seats)
+			}
+			m.append(dimStyle.Render(fmt.Sprintf("✅ License: %s tier\nEmail: %s\nExpiry: %s%s\n\nAll features unlocked. 🐐\n\n",
+				strings.ToUpper(string(m.lic.EffectiveTier())), m.lic.Email, expStr, seatsStr)))
+		}
+		m.textarea.Reset()
+		return m, nil
+
+	case "/run":
+		// Shell command execution with permission prompt
+		if len(parts) < 2 {
+			m.append(dimStyle.Render("Usage: /run <shell command>\nExample: /run ls -la\n\n"))
+			m.textarea.Reset()
+			return m, nil
+		}
+		shellCmd := strings.Join(parts[1:], " ")
+		return m.promptShellRun(shellCmd), nil
+
+	case "/mode":
+		if len(parts) < 2 {
+			modeStr := "agent"
+			if !m.agentMode {
+				modeStr = "chat"
+			}
+			m.append(dimStyle.Render(fmt.Sprintf("Current mode: %s\n\n  /mode agent  — Billy detects and offers to run commands\n  /mode chat   — conversation only, no command execution\n\n", strings.ToUpper(modeStr))))
+		} else {
+			switch parts[1] {
+			case "agent":
+				m.agentMode = true
+				m.append(dimStyle.Render("✅ Switched to AGENT mode.\nBilly will detect commands in responses and ask to run them.\n\n"))
+			case "chat":
+				m.agentMode = false
+				m.cmdQueue = nil
+				m.append(dimStyle.Render("✅ Switched to CHAT mode.\nBilly will answer questions only — no command execution.\n\n"))
+			default:
+				m.append(errorStyle.Render("Unknown mode. Use: /mode agent  or  /mode chat\n\n"))
 			}
 		}
 		m.textarea.Reset()
 		return m, nil
 
 	case "/help":
-		m.append(dimStyle.Render(`
+		modeStr := "AGENT (default)"
+		if !m.agentMode {
+			modeStr = "CHAT"
+		}
+		m.append(dimStyle.Render(fmt.Sprintf(`
 Commands:
   /help              Show this help
-  /license           Show current license status
-  /license <key>     Activate a Billy license key
+  /activate          Activate a Billy license key (interactive prompt)
+  /license           Show current license / tier status
+  /mode [agent|chat] Switch mode (current: %s)
   /model             List installed models (active model highlighted)
   /model <name>      Switch to a different model
   /pull <name>       Download a new model from Ollama library
@@ -605,11 +721,16 @@ Commands:
   /memory            List everything Billy remembers about you
   /memory forget <id> Delete a specific memory
   /memory clear      Wipe all memories
+  /run <cmd>         Run a shell command (asks for permission first)
   /save              Save this conversation
   /history           Browse past conversations (arrow keys + Enter to load)
   /resume <id>       Jump directly to a conversation by ID
   /clear             Clear conversation history
   /quit, /exit       Exit Billy
+
+Agent mode:
+  When Billy suggests a command, a permission prompt appears.
+  Press Enter or y=yes  a=always this session  n/s=skip
 
 Natural language memory:
   "Remember that I prefer Go over Python"
@@ -621,10 +742,10 @@ Keyboard:
   Ctrl+D / Ctrl+C    Quit
 
 Popular models to pull:
-  mistral · llama3 · codellama · phi3 · gemma · neural-chat
+  qwen2.5-coder:7b · llama3 · codellama · phi3 · gemma · mistral
   Full list: https://ollama.com/library
 
-`))
+`, modeStr)))
 
 	case "/models":
 		// Alias for /model with no args
@@ -783,4 +904,168 @@ Popular models to pull:
 	return m, nil
 }
 
+// activateLicense validates the given key, encrypts it, and saves it to SQLite.
+func (m ChatModel) activateLicense(key string) ChatModel {
+	if key == "" {
+		m.append(errorStyle.Render("❌ No key entered. Use /activate to try again.\n\n"))
+		return m
+	}
+	parsed, err := license.Parse(key)
+	if err != nil {
+		m.append(errorStyle.Render("❌ Invalid license key: "+err.Error()+"\n\n"))
+		return m
+	}
+	if !parsed.IsActive() {
+		m.append(errorStyle.Render("❌ License key has expired.\n\n"))
+		return m
+	}
 
+	// Persist encrypted in SQLite (preferred) and plain in config (fallback)
+	if m.store != nil {
+		if err := m.store.SetEncrypted("license_key", []byte(key)); err != nil {
+			m.append(errorStyle.Render("⚠️  Could not save license to database: "+err.Error()+"\n\n"))
+		}
+	}
+	cfg := config.MustLoad()
+	cfg.LicenseKey = key
+	_ = config.Save(cfg)
+
+	m.lic = parsed
+	seatsNote := ""
+	if parsed.Seats > 0 {
+		seatsNote = fmt.Sprintf(" (%d seats)", parsed.Seats)
+	}
+	m.append(dimStyle.Render(fmt.Sprintf(
+		"✅ License activated! Welcome to %s tier%s, %s 🎉\n\nYour key is encrypted and stored securely.\n\n",
+		strings.ToUpper(string(parsed.EffectiveTier())), seatsNote, parsed.Email,
+	)))
+	return m
+}
+
+// promptShellRun shows a permission prompt before running a shell command.
+func (m ChatModel) promptShellRun(shellCmd string) ChatModel {
+	// Check session-level "always" permission
+	prefix := strings.Fields(shellCmd)[0]
+	if m.shellAlways[prefix] || m.shellAlways["*"] {
+		return m.executeShell(shellCmd)
+	}
+
+	m.shellPending = shellCmd
+	permBox := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("#f59e0b")).
+		Padding(0, 1).
+		Render(fmt.Sprintf(
+			"⚠️  Run this command?\n\n  %s\n\n"+
+				"  [Y] Yes, once   [A] Always this session   [N] No, cancel",
+			lipgloss.NewStyle().Foreground(lipgloss.Color("#38bdf8")).Render(shellCmd),
+		))
+	m.append(permBox + "\n\n")
+	m.textarea.Reset()
+	m.textarea.Placeholder = "y / a / n ..."
+	return m
+}
+
+// executeShell runs a shell command and appends its output to the viewport.
+func (m ChatModel) executeShell(shellCmd string) ChatModel {
+	m.shellPending = ""
+	m.textarea.Placeholder = "Ask Billy anything... (Enter to send, Ctrl+D to quit)"
+	m.textarea.Reset()
+
+	m.append(dimStyle.Render(fmt.Sprintf("$ %s\n", shellCmd)))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "sh", "-c", shellCmd) //nolint:gosec
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+
+	err := cmd.Run()
+	output := out.String()
+	if output == "" {
+		output = "(no output)"
+	}
+	if err != nil {
+		m.append(errorStyle.Render("Exit error: "+err.Error()+"\n") + output + "\n\n")
+	} else {
+		m.append(output + "\n\n")
+	}
+	return m
+}
+
+
+
+// agentSystemPrompt is prepended when in AGENT mode.
+const agentSystemPrompt = `You are Billy, an agentic AI coding assistant running locally via Ollama.
+
+AGENT MODE is active. Your job is to take action, not just advise.
+
+Rules:
+- When the user asks you to run, create, install, build, or do ANYTHING that requires shell commands, provide the EXACT commands in ` + "```bash" + ` code blocks — never just describe them.
+- When creating files, include the full file content in a code block. Put the filename as a comment on the first line (e.g. // main.go).
+- Break complex tasks into sequential steps. Each step gets its own ` + "```bash" + ` block.
+- After the user approves and runs a command, they will paste the output back. Adjust your next step based on it.
+- Be direct and action-oriented. Minimize prose, maximize commands.
+- If something could be destructive (rm -rf, DROP TABLE, etc), warn clearly before the block.
+
+Example good response:
+  Here's how to initialize a Go module:
+  ` + "```bash" + `
+  mkdir myapp && cd myapp
+  go mod init github.com/you/myapp
+  ` + "```" + `
+  Then create your main file:
+  ` + "```bash" + `
+  cat > main.go << 'EOF'
+  package main
+  import "fmt"
+  func main() { fmt.Println("hello") }
+  EOF
+  ` + "```" + ``
+
+// extractShellCommands finds all ```bash / ```sh / ```shell blocks in an AI
+// response and returns each block's trimmed content as a command string.
+func extractShellCommands(content string) []string {
+var cmds []string
+lines := strings.Split(content, "\n")
+inBlock := false
+var block strings.Builder
+
+for _, line := range lines {
+if !inBlock {
+stripped := strings.TrimSpace(line)
+if strings.HasPrefix(stripped, "```") {
+lang := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(stripped, "```")))
+if lang == "bash" || lang == "sh" || lang == "shell" || lang == "zsh" {
+inBlock = true
+block.Reset()
+}
+}
+continue
+}
+// Inside a block
+if strings.TrimSpace(line) == "```" {
+inBlock = false
+cmd := strings.TrimSpace(block.String())
+if cmd != "" {
+cmds = append(cmds, cmd)
+}
+continue
+}
+block.WriteString(line + "\n")
+}
+return cmds
+}
+
+// promptNextQueuedCmd pops the first command from cmdQueue and shows its
+// permission prompt. Call this after a command completes or is skipped.
+func (m ChatModel) promptNextQueuedCmd() ChatModel {
+if len(m.cmdQueue) == 0 {
+return m
+}
+cmd := m.cmdQueue[0]
+m.cmdQueue = m.cmdQueue[1:]
+return m.promptShellRun(cmd)
+}
