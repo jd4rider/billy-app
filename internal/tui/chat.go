@@ -481,7 +481,7 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			m.history = append(m.history, backend.Message{Role: "user", Content: input})
 			m.tokenEstimate = estimateTokens(m.history)
-			m.append(userStyle.Render("You") + "\n" + input + "\n\n")
+			m.append(userStyle.Render("You ▸") + " " + input + "\n\n")
 
 			// Persist user message
 			if m.store != nil && m.conversationID != "" {
@@ -806,7 +806,7 @@ func (m ChatModel) loadConversation(id string) (ChatModel, tea.Cmd) {
 		m.history = append(m.history, backend.Message{Role: msg.Role, Content: msg.Content})
 		switch msg.Role {
 		case "user":
-			m.content += userStyle.Render("You") + "\n" + msg.Content + "\n\n"
+			m.content += userStyle.Render("You ▸") + " " + msg.Content + "\n\n"
 		case "assistant":
 			m.content += assistantStyle.Render("Billy") + "\n" + msg.Content + "\n\n"
 		}
@@ -1224,7 +1224,7 @@ Popular models to pull:
 			return m, nil
 		}
 		task := strings.Join(parts[1:], " ")
-		m.append(userStyle.Render("You: ") + fmt.Sprintf("/suggest %s\n\n", task))
+		m.append(userStyle.Render("You ▸") + fmt.Sprintf(" /suggest %s\n\n", task))
 		m.waiting = true
 		m.textarea.Reset()
 		return m, tea.Batch(m.spinner.Tick, m.suggestCmd(task))
@@ -1236,7 +1236,7 @@ Popular models to pull:
 			return m, nil
 		}
 		shellCmd := strings.Join(parts[1:], " ")
-		m.append(userStyle.Render("You: ") + fmt.Sprintf("/explain %s\n\n", shellCmd))
+		m.append(userStyle.Render("You ▸") + fmt.Sprintf(" /explain %s\n\n", shellCmd))
 		m.waiting = true
 		m.textarea.Reset()
 		return m, tea.Batch(m.spinner.Tick, m.explainCmd(shellCmd))
