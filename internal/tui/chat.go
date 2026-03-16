@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -54,20 +56,26 @@ type pickerItem struct {
 
 var commandList = []pickerItem{
 	{"/activate", "Activate a Billy license key (prompts for key)", false},
+	{"/cd", "Change working directory (autocompletes paths)", true},
 	{"/clear", "Clear the current chat", false},
 	{"/compact", "Summarize and compress context", false},
+	{"/explain", "Explain what a shell command does", true},
+	{"/git", "Show git status and recent commits", false},
 	{"/help", "Show all commands", false},
 	{"/history", "Browse past conversations", false},
 	{"/license", "Show current license / tier status", false},
+	{"/ls", "List files in current (or given) directory", true},
 	{"/memory", "List or manage memories", false},
 	{"/mode", "Switch between agent and chat mode", true},
 	{"/model", "List or switch Ollama models", true},
 	{"/pull", "Download a model from Ollama", true},
+	{"/pwd", "Print current working directory", false},
 	{"/quit", "Exit Billy", false},
 	{"/resume", "Load a past conversation by ID", true},
 	{"/run", "Run a shell command (with permission prompt)", true},
 	{"/save", "Save current conversation", false},
 	{"/session", "Save a session checkpoint", false},
+	{"/suggest", "Suggest a shell command for a task", true},
 }
 
 func filterCommands(input string) []pickerItem {
@@ -81,6 +89,92 @@ func filterCommands(input string) []pickerItem {
 		}
 	}
 	return out
+}
+
+// filterDirs returns /cd <path> picker items for directory autocomplete.
+// partial is whatever the user typed after "/cd ".
+func filterDirs(workDir, partial string) []pickerItem {
+	var baseDir, prefix string
+
+	expandHome := func(p string) string {
+		if strings.HasPrefix(p, "~/") {
+			if home, err := os.UserHomeDir(); err == nil {
+				return filepath.Join(home, p[2:])
+			}
+		}
+		return p
+	}
+
+	partial = expandHome(partial)
+
+	switch {
+	case partial == "":
+		baseDir = workDir
+		prefix = ""
+	case strings.HasSuffix(partial, string(filepath.Separator)):
+		baseDir = filepath.Clean(partial)
+		if !filepath.IsAbs(baseDir) {
+			baseDir = filepath.Join(workDir, baseDir)
+		}
+		prefix = ""
+	default:
+		joined := partial
+		if !filepath.IsAbs(partial) {
+			joined = filepath.Join(workDir, partial)
+		}
+		baseDir = filepath.Dir(joined)
+		prefix = filepath.Base(joined)
+	}
+
+	entries, err := os.ReadDir(baseDir)
+	if err != nil {
+		return nil
+	}
+
+	home, _ := os.UserHomeDir()
+
+	// Always offer ".." to go up (unless already at root)
+	var items []pickerItem
+	if partial == "" && workDir != "/" {
+		parent := filepath.Dir(workDir)
+		displayParent := parent
+		if home != "" && strings.HasPrefix(parent, home) {
+			displayParent = "~" + parent[len(home):]
+		}
+		items = append(items, pickerItem{
+			cmd:     "/cd ..",
+			desc:    "↑ " + displayParent,
+			hasArgs: false,
+		})
+	}
+
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		// Hide dot-dirs unless user explicitly typed a dot
+		if strings.HasPrefix(name, ".") && !strings.HasPrefix(prefix, ".") {
+			continue
+		}
+		if prefix != "" && !strings.HasPrefix(strings.ToLower(name), strings.ToLower(prefix)) {
+			continue
+		}
+		fullPath := filepath.Join(baseDir, name)
+		// Prefer relative path from workDir; fall back to ~/… or absolute
+		displayPath := fullPath
+		if rel, err := filepath.Rel(workDir, fullPath); err == nil && !strings.HasPrefix(rel, "..") {
+			displayPath = rel
+		} else if home != "" && strings.HasPrefix(fullPath, home) {
+			displayPath = "~" + fullPath[len(home):]
+		}
+		items = append(items, pickerItem{
+			cmd:     "/cd " + displayPath,
+			desc:    "📁 " + name,
+			hasArgs: false,
+		})
+	}
+	return items
 }
 
 // pullMsg carries progress or completion back into the update loop.
@@ -101,6 +195,16 @@ type compactMsg struct {
 type checkpointMsg struct {
 	name    string
 	summary string
+	err     error
+}
+
+type suggestMsg struct {
+	content string
+	err     error
+}
+
+type explainMsg struct {
+	content string
 	err     error
 }
 
@@ -141,6 +245,7 @@ type ChatModel struct {
 	agentMode      bool            // true = agentic (default), false = chat only
 	tokenEstimate  int             // rough token count for current history
 	compacted      bool            // true if history has been compacted
+	workDir        string          // current working directory for the session
 }
 
 // New creates a new ChatModel.
@@ -175,6 +280,10 @@ func New(cfg *config.Config, b backend.Backend, s *store.Store) ChatModel {
 		spinner:     sp,
 		shellAlways: make(map[string]bool),
 		agentMode:   true, // agentic by default
+	}
+
+	if wd, err := os.Getwd(); err == nil {
+		m.workDir = wd
 	}
 
 	// Load license — SQLite encrypted store takes priority, config.toml is fallback
@@ -456,6 +565,24 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.append(dimStyle.Render(fmt.Sprintf("✅ Checkpoint '%s' saved!\n\nSummary: %s\n\n", msg.name, msg.summary)))
 		}
 		return m, nil
+
+	case suggestMsg:
+		m.waiting = false
+		if msg.err != nil {
+			m.append(errorStyle.Render("❌ Suggest failed: " + msg.err.Error() + "\n\n"))
+		} else {
+			m.append(assistantStyle.Render("Billy: ") + wordwrap.String(msg.content, m.viewport.Width-4) + "\n\n")
+		}
+		return m, nil
+
+	case explainMsg:
+		m.waiting = false
+		if msg.err != nil {
+			m.append(errorStyle.Render("❌ Explain failed: " + msg.err.Error() + "\n\n"))
+		} else {
+			m.append(assistantStyle.Render("Billy: ") + wordwrap.String(msg.content, m.viewport.Width-4) + "\n\n")
+		}
+		return m, nil
 	}
 
 	m.textarea, taCmd = m.textarea.Update(msg)
@@ -466,7 +593,18 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// user typed a new character). Blink ticks and other non-key messages must
 	// NOT reset the selection — that was causing the picker to jump to the top.
 	val := m.textarea.Value()
-	if strings.HasPrefix(val, "/") && !strings.Contains(val, " ") {
+	if strings.HasPrefix(val, "/cd ") {
+		// Directory autocomplete mode
+		partial := strings.TrimPrefix(val, "/cd ")
+		newItems := filterDirs(m.workDir, partial)
+		listChanged := len(newItems) != len(m.pickerItems) ||
+			(len(newItems) > 0 && len(m.pickerItems) > 0 && newItems[0].cmd != m.pickerItems[0].cmd)
+		if listChanged {
+			m.pickerIdx = 0
+		}
+		m.pickerItems = newItems
+		m.showPicker = len(newItems) > 0
+	} else if strings.HasPrefix(val, "/") && !strings.Contains(val, " ") {
 		newItems := filterCommands(val)
 		listChanged := len(newItems) != len(m.pickerItems) ||
 			(len(newItems) > 0 && len(m.pickerItems) > 0 && newItems[0].cmd != m.pickerItems[0].cmd)
@@ -503,7 +641,8 @@ func (m ChatModel) View() string {
 		if !m.agentMode {
 			modeBadge = dimStyle.Render("[CHAT]")
 		}
-		status = dimStyle.Render(fmt.Sprintf(" %s · %s  — PgUp/PgDn to scroll", m.backend.Name(), m.backend.CurrentModel())) + " " + modeBadge + " " + badge
+		pwdBadge := dimStyle.Render(abbreviatePath(m.workDir))
+		status = dimStyle.Render(fmt.Sprintf(" %s · %s  — PgUp/PgDn to scroll", m.backend.Name(), m.backend.CurrentModel())) + " " + modeBadge + " " + badge + "  " + pwdBadge
 		if m.tokenEstimate > 3072 {
 			status += " " + lipgloss.NewStyle().Foreground(lipgloss.Color("#f59e0b")).Render(fmt.Sprintf("[~%dk tokens]", m.tokenEstimate/1000))
 		}
@@ -537,6 +676,29 @@ func licenseBadge(lic *license.License) string {
 	default:
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render("[FREE]")
 	}
+}
+
+// abbreviatePath replaces the home directory with ~ and keeps the last 2 segments
+// if the full path is long, so the status bar stays compact.
+func abbreviatePath(p string) string {
+	if p == "" {
+		return "~"
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		if p == home {
+			return "~"
+		}
+		if strings.HasPrefix(p, home+string(filepath.Separator)) {
+			p = "~" + p[len(home):]
+		}
+	}
+	// Keep last 3 path segments if still long
+	parts := strings.Split(filepath.ToSlash(p), "/")
+	if len(parts) > 4 {
+		parts = append([]string{"…"}, parts[len(parts)-3:]...)
+		return strings.Join(parts, "/")
+	}
+	return p
 }
 
 func (m ChatModel) renderPicker() string {
@@ -783,6 +945,16 @@ Commands:
   /clear             Clear conversation history
   /quit, /exit       Exit Billy
 
+Filesystem:
+  /pwd               Print current working directory
+  /cd <path>         Change directory (↑↓ autocomplete as you type)
+  /ls [path]         List files in directory
+  /git               Show git branch, status, and recent commits
+
+AI shell tools (like gh copilot):
+  /suggest <task>    Suggest a shell command for a natural language task
+  /explain <cmd>     Explain what a shell command does
+
 Agent mode:
   When Billy suggests a command, a permission prompt appears.
   Press Enter or y=yes  a=always this session  n/s=skip
@@ -1025,10 +1197,165 @@ Popular models to pull:
 		m.textarea.Reset()
 		return m, nil
 
+	case "/pwd":
+		return m.cmdPwd()
+
+	case "/cd":
+		target := ""
+		if len(parts) > 1 {
+			target = strings.Join(parts[1:], " ")
+		}
+		return m.cmdCd(target)
+
+	case "/ls":
+		target := ""
+		if len(parts) > 1 {
+			target = strings.Join(parts[1:], " ")
+		}
+		return m.cmdLs(target)
+
+	case "/git":
+		return m.cmdGit()
+
+	case "/suggest":
+		if len(parts) < 2 {
+			m.append(errorStyle.Render("Usage: /suggest <describe what you want to do>\nExample: /suggest list all Go files modified today\n\n"))
+			m.textarea.Reset()
+			return m, nil
+		}
+		task := strings.Join(parts[1:], " ")
+		m.append(userStyle.Render("You: ") + fmt.Sprintf("/suggest %s\n\n", task))
+		m.waiting = true
+		m.textarea.Reset()
+		return m, tea.Batch(m.spinner.Tick, m.suggestCmd(task))
+
+	case "/explain":
+		if len(parts) < 2 {
+			m.append(errorStyle.Render("Usage: /explain <shell command>\nExample: /explain find . -name '*.go' -mtime -1\n\n"))
+			m.textarea.Reset()
+			return m, nil
+		}
+		shellCmd := strings.Join(parts[1:], " ")
+		m.append(userStyle.Render("You: ") + fmt.Sprintf("/explain %s\n\n", shellCmd))
+		m.waiting = true
+		m.textarea.Reset()
+		return m, tea.Batch(m.spinner.Tick, m.explainCmd(shellCmd))
+
 	default:
 		m.append(errorStyle.Render(fmt.Sprintf("Unknown command: %s  (try /help)\n\n", cmd)))
 	}
 
+	return m, nil
+}
+
+// --- Directory & shell helper commands ---
+
+func (m ChatModel) cmdPwd() (ChatModel, tea.Cmd) {
+	m.append(dimStyle.Render(fmt.Sprintf("📁 %s\n\n", m.workDir)))
+	m.textarea.Reset()
+	return m, nil
+}
+
+func (m ChatModel) cmdCd(target string) (ChatModel, tea.Cmd) {
+	if target == "" || target == "~" {
+		home, _ := os.UserHomeDir()
+		target = home
+	} else if strings.HasPrefix(target, "~/") {
+		home, _ := os.UserHomeDir()
+		target = filepath.Join(home, target[2:])
+	} else if !filepath.IsAbs(target) {
+		target = filepath.Join(m.workDir, target)
+	}
+	target = filepath.Clean(target)
+	info, err := os.Stat(target)
+	if err != nil || !info.IsDir() {
+		m.append(errorStyle.Render(fmt.Sprintf("cd: no such directory: %s\n\n", target)))
+		m.textarea.Reset()
+		return m, nil
+	}
+	if err := os.Chdir(target); err != nil {
+		m.append(errorStyle.Render(fmt.Sprintf("cd: %s\n\n", err)))
+		m.textarea.Reset()
+		return m, nil
+	}
+	m.workDir = target
+	m.append(dimStyle.Render(fmt.Sprintf("📁 → %s\n\n", abbreviatePath(target))))
+	m.textarea.Reset()
+	return m, nil
+}
+
+func (m ChatModel) cmdLs(target string) (ChatModel, tea.Cmd) {
+	dir := m.workDir
+	if target != "" {
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(m.workDir, target)
+		}
+		dir = filepath.Clean(target)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		m.append(errorStyle.Render(fmt.Sprintf("ls: %s\n\n", err)))
+		m.textarea.Reset()
+		return m, nil
+	}
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("📂 %s\n\n", abbreviatePath(dir)))
+	dirs, files := 0, 0
+	for _, e := range entries {
+		if e.IsDir() {
+			sb.WriteString(fmt.Sprintf("  📁 %s/\n", e.Name()))
+			dirs++
+		} else {
+			sb.WriteString(fmt.Sprintf("  📄 %s\n", e.Name()))
+			files++
+		}
+	}
+	sb.WriteString(fmt.Sprintf("\n  %d dirs, %d files\n\n", dirs, files))
+	m.append(dimStyle.Render(sb.String()))
+	m.textarea.Reset()
+	return m, nil
+}
+
+func (m ChatModel) cmdGit() (ChatModel, tea.Cmd) {
+	runGit := func(args ...string) string {
+		c := exec.Command("git", args...)
+		c.Dir = m.workDir
+		out, err := c.CombinedOutput()
+		if err != nil {
+			return ""
+		}
+		return strings.TrimSpace(string(out))
+	}
+
+	branch := runGit("rev-parse", "--abbrev-ref", "HEAD")
+	if branch == "" {
+		m.append(dimStyle.Render("  Not a git repository.\n\n"))
+		m.textarea.Reset()
+		return m, nil
+	}
+	status := runGit("status", "--short")
+	log := runGit("log", "--oneline", "-7")
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("🌿 Branch: %s\n\n", branch))
+	if status != "" {
+		sb.WriteString("Changes:\n")
+		for _, line := range strings.Split(status, "\n") {
+			sb.WriteString("  " + line + "\n")
+		}
+		sb.WriteString("\n")
+	} else {
+		sb.WriteString("  Working tree clean\n\n")
+	}
+	if log != "" {
+		sb.WriteString("Recent commits:\n")
+		for _, line := range strings.Split(log, "\n") {
+			sb.WriteString("  " + line + "\n")
+		}
+		sb.WriteString("\n")
+	}
+	m.append(dimStyle.Render(sb.String()))
+	m.textarea.Reset()
 	return m, nil
 }
 
@@ -1086,6 +1413,47 @@ func (m ChatModel) saveCheckpoint(name string) tea.Cmd {
 			)
 		}
 		return checkpointMsg{name: name, summary: summary}
+	}
+}
+
+// suggestCmd asks the AI to suggest a shell command for a natural-language task.
+func (m ChatModel) suggestCmd(task string) tea.Cmd {
+	b := m.backend
+	workDir := m.workDir
+	return func() tea.Msg {
+		prompt := fmt.Sprintf(
+			"You are a shell command expert. The user is in directory: %s\n\n"+
+				"Suggest the best shell command to: %s\n\n"+
+				"Respond with:\n1. The exact command (in a code block)\n2. A brief explanation of what it does and any important flags.\n"+
+				"If multiple approaches exist, show the best one first.",
+			workDir, task,
+		)
+		result, err := b.Chat(context.Background(), []backend.Message{
+			{Role: "user", Content: prompt},
+		}, backend.ChatOptions{Temperature: 0.2, NumPredict: 512})
+		if err != nil {
+			return suggestMsg{err: err}
+		}
+		return suggestMsg{content: result}
+	}
+}
+
+// explainCmd asks the AI to explain what a shell command does.
+func (m ChatModel) explainCmd(shellCmd string) tea.Cmd {
+	b := m.backend
+	return func() tea.Msg {
+		prompt := fmt.Sprintf(
+			"Explain the following shell command clearly and concisely. Break down each part, flag, and argument. "+
+				"Mention any gotchas or common mistakes.\n\nCommand:\n```\n%s\n```",
+			shellCmd,
+		)
+		result, err := b.Chat(context.Background(), []backend.Message{
+			{Role: "user", Content: prompt},
+		}, backend.ChatOptions{Temperature: 0.2, NumPredict: 768})
+		if err != nil {
+			return explainMsg{err: err}
+		}
+		return explainMsg{content: result}
 	}
 }
 
