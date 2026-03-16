@@ -7,10 +7,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/charmbracelet/bubbles/list"
+	"github.com/charmbracelet/bubbles/progress"
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
@@ -217,6 +219,20 @@ func estimateTokens(history []backend.Message) int {
 	return total
 }
 
+// ansiRegexp strips ANSI escape sequences for plain-text line searching.
+var ansiRegexp = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+
+func stripANSI(s string) string { return ansiRegexp.ReplaceAllString(s, "") }
+
+// collapsedOutput tracks a long command output that has been folded in the viewport.
+type collapsedOutput struct {
+	marker   string // unique placeholder embedded in m.content
+	full     string // complete output text (always sent to AI)
+	hidden   int    // number of lines hidden below the preview
+	expanded bool   // whether the user has expanded it
+	hintLine int    // line index in rendered viewport content (updated by render)
+}
+
 // ChatModel is the Bubble Tea model for the main chat interface.
 type ChatModel struct {
 	cfg            *config.Config
@@ -241,6 +257,13 @@ type ChatModel struct {
 	activating     bool            // true while /activate key-entry prompt is shown
 	shellPending   string          // shell command awaiting user permission
 	shellAlways    map[string]bool // session-level "always run" prefixes
+	shellPickerIdx    int              // 0=Run once, 1=Always, 2=Cancel
+	progressBar       progress.Model    // animated bar for /pull downloads
+	isPulling         bool               // true while model pull in progress
+	pullStatus        string             // current pull status string from Ollama
+	pullModelName     string             // model name being pulled
+	pendingCmdOutputs []string         // shell outputs buffered for AI feedback
+	collapsedOutputs  []collapsedOutput // folded long command outputs
 	cmdQueue       []string        // AI-suggested commands pending permission
 	agentMode      bool            // true = agentic (default), false = chat only
 	tokenEstimate  int             // rough token count for current history
@@ -278,8 +301,12 @@ func New(cfg *config.Config, b backend.Backend, s *store.Store) ChatModel {
 		viewport:    vp,
 		textarea:    ta,
 		spinner:     sp,
-		shellAlways: make(map[string]bool),
-		agentMode:   true, // agentic by default
+		shellAlways:  make(map[string]bool),
+		agentMode:    true, // agentic by default
+		progressBar:  progress.New(
+			progress.WithGradient("#38bdf8", "#a855f7"),
+			progress.WithWidth(60),
+		),
 	}
 
 	if wd, err := os.Getwd(); err == nil {
@@ -321,6 +348,7 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.viewport.Width = msg.Width - 4
 		m.viewport.Height = msg.Height - 8
 		m.textarea.SetWidth(msg.Width - 4)
+		m.progressBar.Width = msg.Width - 12
 		if m.historyMode {
 			m.historyList.SetWidth(msg.Width - 4)
 			m.historyList.SetHeight(msg.Height - 6)
@@ -366,30 +394,57 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, taCmd
 	}
 
-	// ── Shell permission response ────────────────────────────────────────
-	if m.shellPending != "" && msg.Type == tea.KeyEnter {
-		resp := strings.ToLower(strings.TrimSpace(m.textarea.Value()))
-		pending := m.shellPending
-		m.shellPending = ""
-		switch resp {
-		case "y", "yes", "": // bare Enter = yes
-			m = m.executeShell(pending)
-		case "a", "always":
-			prefix := strings.Fields(pending)[0]
-			m.shellAlways[prefix] = true
-			m = m.executeShell(pending)
-		default: // n, no, skip, s
+	// ── Shell permission picker ────────────────────────────────────────────
+	if m.shellPending != "" {
+		switch msg.Type {
+		case tea.KeyUp:
+			if m.shellPickerIdx > 0 {
+				m.shellPickerIdx--
+			}
+			return m, nil
+		case tea.KeyDown:
+			if m.shellPickerIdx < 2 {
+				m.shellPickerIdx++
+			}
+			return m, nil
+		case tea.KeyEnter:
+			pending := m.shellPending
+			m.shellPending = ""
+			switch m.shellPickerIdx {
+			case 0: // Run once
+				m = m.executeShell(pending)
+			case 1: // Always this session
+				prefix := strings.Fields(pending)[0]
+				m.shellAlways[prefix] = true
+				m = m.executeShell(pending)
+			case 2: // Cancel
+				m.append(dimStyle.Render("Skipped.\n\n"))
+				m.cmdQueue = nil
+				m.pendingCmdOutputs = nil
+			}
+			m.shellPickerIdx = 0
+			if len(m.cmdQueue) > 0 {
+				m = m.promptNextQueuedCmd()
+				return m, nil
+			}
+			if len(m.pendingCmdOutputs) > 0 {
+				m, cmd := m.flushCmdOutputs()
+				return m, cmd
+			}
+			m.textarea.Placeholder = "Ask Billy anything... (Enter to send, Ctrl+D to quit)"
+			m.textarea.Reset()
+			return m, nil
+		case tea.KeyEsc:
+			m.shellPending = ""
+			m.shellPickerIdx = 0
+			m.cmdQueue = nil
+			m.pendingCmdOutputs = nil
 			m.textarea.Placeholder = "Ask Billy anything... (Enter to send, Ctrl+D to quit)"
 			m.textarea.Reset()
 			m.append(dimStyle.Render("Skipped.\n\n"))
-			m.cmdQueue = nil // cancel rest of queue on explicit no
+			return m, nil
 		}
-		// Process next queued command if any
-		if len(m.cmdQueue) > 0 {
-			m = m.promptNextQueuedCmd()
-		} else {
-			m.textarea.Placeholder = "Ask Billy anything... (Enter to send, Ctrl+D to quit)"
-		}
+		// Block all other keypresses while permission picker is active
 		return m, nil
 	}
 	// Command picker navigation — intercepts keys when picker is visible
@@ -425,6 +480,16 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 	switch msg.Type {
+		case tea.KeyCtrlX:
+			// Expand the most recently collapsed command output
+			for i := len(m.collapsedOutputs) - 1; i >= 0; i-- {
+				if !m.collapsedOutputs[i].expanded {
+					m.collapsedOutputs[i].expanded = true
+					m.render()
+					return m, nil
+				}
+			}
+			return m, nil
 		case tea.KeyCtrlD, tea.KeyCtrlC:
 			return m, tea.Quit
 		case tea.KeyEnter:
@@ -458,8 +523,8 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if fact, ok := memory.DetectAndExtract(input); ok {
 				if m.store != nil {
 					if err := m.store.SaveMemory(uuid.New().String(), fact); err == nil {
-						m.append(assistantStyle.Render("Billy") + "\n" +
-							dimStyle.Render(fmt.Sprintf("Got it! I'll remember: \"%s\"\n", fact)) + "\n")
+						m.append(assistantStyle.Render("Billy >") + " " +
+							dimStyle.Render(fmt.Sprintf("Got it! I'll remember: \"%s\"\n\n", fact)))
 					} else {
 						m.append(errorStyle.Render("Couldn't save memory: "+err.Error()) + "\n\n")
 					}
@@ -481,7 +546,7 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			m.history = append(m.history, backend.Message{Role: "user", Content: input})
 			m.tokenEstimate = estimateTokens(m.history)
-			m.append(userStyle.Render("You ▸") + " " + input + "\n\n")
+			m.append(userStyle.Render("You >") + " " + input + "\n\n")
 
 			// Persist user message
 			if m.store != nil && m.conversationID != "" {
@@ -492,24 +557,34 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Batch(m.sendChat(), m.spinner.Tick)
 		}
 
+	case progress.FrameMsg:
+		if m.isPulling {
+			pm, cmd := m.progressBar.Update(msg)
+			m.progressBar = pm.(progress.Model)
+			return m, cmd
+		}
+		return m, nil
+
 	case pullMsg:
 		if msg.err != nil {
+			m.isPulling = false
 			m.waiting = false
 			m.append(errorStyle.Render("Pull failed: "+msg.err.Error()) + "\n\n")
 		} else if msg.progress == nil {
 			// Pull complete
+			m.isPulling = false
 			m.waiting = false
-			m.append(dimStyle.Render("✅ Model downloaded successfully!\n\n"))
+			m.append(dimStyle.Render(fmt.Sprintf("✅ Downloaded %s successfully!\n\n", m.pullModelName)))
 		} else {
-			// Progress update — show inline, keep spinner going
-			pct := ""
+			// Progress update — drive the animated bar
+			m.isPulling = true
+			m.pullStatus = msg.progress.Status
 			if msg.progress.Total > 0 {
-				pct = fmt.Sprintf(" %.0f%%", float64(msg.progress.Completed)/float64(msg.progress.Total)*100)
+				pct := float64(msg.progress.Completed) / float64(msg.progress.Total)
+				return m, m.progressBar.SetPercent(pct)
 			}
-			// Replace last line with progress (re-append truncates content)
-			m.append(dimStyle.Render(fmt.Sprintf("  %s%s\n", msg.progress.Status, pct)))
 		}
-		return m, nil
+		return m, m.spinner.Tick
 
 	case chatMsg:
 		m.waiting = false
@@ -518,7 +593,7 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.history = append(m.history, backend.Message{Role: "assistant", Content: msg.content})
 			m.tokenEstimate = estimateTokens(m.history)
-			m.append(assistantStyle.Render("Billy") + "\n" + msg.content + "\n\n")
+			m.append(assistantStyle.Render("Billy >") + " " + msg.content + "\n\n")
 
 			// Persist assistant message
 			if m.store != nil && m.conversationID != "" {
@@ -531,17 +606,41 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if len(cmds) > 0 {
 					m.cmdQueue = append(m.cmdQueue, cmds...)
 					m = m.promptNextQueuedCmd()
+					// If shellAlways drained the whole queue, flush outputs now
+					if m.shellPending == "" && len(m.cmdQueue) == 0 && len(m.pendingCmdOutputs) > 0 {
+						m, flushCmd := m.flushCmdOutputs()
+						return m, flushCmd
+					}
 				}
 			}
 		}
 		return m, nil
 
 	case spinner.TickMsg:
-		if m.waiting {
+		if m.waiting || m.isPulling {
 			m.spinner, spCmd = m.spinner.Update(msg)
 			return m, spCmd
 		}
 		return m, nil
+
+	case tea.MouseMsg:
+		// Left-click inside the viewport to expand a collapsed output block
+		if msg.Button == tea.MouseButtonLeft && msg.Action == tea.MouseActionPress {
+			// Viewport content starts at Y=1 (Y=0 is the top border)
+			if msg.Y >= 1 && msg.Y <= m.viewport.Height {
+				clickedLine := (msg.Y - 1) + m.viewport.YOffset
+				for i := range m.collapsedOutputs {
+					if !m.collapsedOutputs[i].expanded && m.collapsedOutputs[i].hintLine == clickedLine {
+						m.collapsedOutputs[i].expanded = true
+						m.render()
+						return m, nil
+					}
+				}
+			}
+		}
+		// Forward to viewport for mouse-wheel scrolling
+		m.viewport, vpCmd = m.viewport.Update(msg)
+		return m, vpCmd
 
 	case compactMsg:
 		m.waiting = false
@@ -571,7 +670,7 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.append(errorStyle.Render("❌ Suggest failed: " + msg.err.Error() + "\n\n"))
 		} else {
-			m.append(assistantStyle.Render("Billy: ") + wordwrap.String(msg.content, m.viewport.Width-4) + "\n\n")
+			m.append(assistantStyle.Render("Billy >") + " " + wordwrap.String(msg.content, m.viewport.Width-4) + "\n\n")
 		}
 		return m, nil
 
@@ -580,7 +679,7 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.append(errorStyle.Render("❌ Explain failed: " + msg.err.Error() + "\n\n"))
 		} else {
-			m.append(assistantStyle.Render("Billy: ") + wordwrap.String(msg.content, m.viewport.Width-4) + "\n\n")
+			m.append(assistantStyle.Render("Billy >") + " " + wordwrap.String(msg.content, m.viewport.Width-4) + "\n\n")
 		}
 		return m, nil
 	}
@@ -633,7 +732,9 @@ func (m ChatModel) View() string {
 	}
 
 	var status string
-	if m.waiting {
+	if m.isPulling {
+		status = m.spinner.View() + dimStyle.Render(fmt.Sprintf(" Downloading %s · %s", m.pullModelName, m.pullStatus))
+	} else if m.waiting {
 		status = m.spinner.View() + dimStyle.Render(" Billy is thinking...")
 	} else {
 		badge := licenseBadge(m.lic)
@@ -643,8 +744,8 @@ func (m ChatModel) View() string {
 		}
 		pwdBadge := dimStyle.Render(abbreviatePath(m.workDir))
 		status = dimStyle.Render(fmt.Sprintf(" %s · %s  — PgUp/PgDn to scroll", m.backend.Name(), m.backend.CurrentModel())) + " " + modeBadge + " " + badge + "  " + pwdBadge
-		if m.tokenEstimate > 3072 {
-			status += " " + lipgloss.NewStyle().Foreground(lipgloss.Color("#f59e0b")).Render(fmt.Sprintf("[~%dk tokens]", m.tokenEstimate/1000))
+		if m.tokenEstimate > 0 {
+			status += " " + renderTokenBar(m.tokenEstimate)
 		}
 	}
 
@@ -652,7 +753,18 @@ func (m ChatModel) View() string {
 		borderStyle.Width(m.width-2).Render(m.viewport.View()),
 		status,
 	}
-	if picker := m.renderPicker(); picker != "" {
+	if m.isPulling {
+		pullOverlay := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("#38bdf8")).
+			Padding(0, 1).
+			Render(dimStyle.Render("⬇  "+m.pullModelName) + "\n" + m.progressBar.View())
+		parts = append(parts, pullOverlay)
+	} else if m.shellPending != "" {
+		if picker := m.renderShellPicker(); picker != "" {
+			parts = append(parts, picker)
+		}
+	} else if picker := m.renderPicker(); picker != "" {
 		parts = append(parts, picker)
 	}
 	parts = append(parts, borderStyle.Width(m.width-2).Render(m.textarea.View()))
@@ -676,6 +788,26 @@ func licenseBadge(lic *license.License) string {
 	default:
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render("[FREE]")
 	}
+}
+
+// renderTokenBar renders a compact coloured context-fill bar for the status line.
+func renderTokenBar(estimate int) string {
+	const maxCtx = 4096
+	const barWidth = 10
+	pct := float64(estimate) / maxCtx
+	if pct > 1.0 {
+		pct = 1.0
+	}
+	color := "#22c55e"
+	if pct > 0.9 {
+		color = "#ef4444"
+	} else if pct > 0.75 {
+		color = "#f59e0b"
+	}
+	filled := int(pct * barWidth)
+	return lipgloss.NewStyle().Foreground(lipgloss.Color(color)).Render(strings.Repeat("█", filled)) +
+		lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render(strings.Repeat("░", barWidth-filled)) +
+		" " + dimStyle.Render(fmt.Sprintf("%dk", estimate/1000))
 }
 
 // abbreviatePath replaces the home directory with ~ and keeps the last 2 segments
@@ -762,20 +894,103 @@ func (m ChatModel) renderPicker() string {
 		Render(strings.Join(rows, "\n"))
 }
 
+// renderShellPicker renders the arrow-key permission picker for agentic shell commands.
+func (m ChatModel) renderShellPicker() string {
+	if m.shellPending == "" {
+		return ""
+	}
+	cmdHighlight := lipgloss.NewStyle().Foreground(lipgloss.Color("#38bdf8")).Bold(true)
+	selectedStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#f59e0b")).Bold(true)
+	dimRow := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	options := [3]string{"Run once", "Always this session", "Cancel"}
+	var rows []string
+	rows = append(rows, cmdHighlight.Render("⚡ "+m.shellPending))
+	rows = append(rows, "")
+	for i, opt := range options {
+		if i == m.shellPickerIdx {
+			rows = append(rows, selectedStyle.Render("▶  "+opt))
+		} else {
+			rows = append(rows, dimRow.Render("   "+opt))
+		}
+	}
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("#f59e0b")).
+		Padding(0, 1).
+		Render(strings.Join(rows, "\n"))
+}
+
 // append adds raw text to the content buffer then re-renders the viewport.
 func (m *ChatModel) append(text string) {
+	// lipgloss.Render does not emit a trailing newline on the last line, so
+	// we must ensure content always ends with \n before appending new text.
+	if len(m.content) > 0 && !strings.HasSuffix(m.content, "\n") {
+		m.content += "\n"
+	}
 	m.content += text
 	m.render()
 }
 
+// appendCmdOutput appends command output to the viewport, collapsing it when it
+// exceeds the preview threshold. The full record is always sent to AI context.
+func (m *ChatModel) appendCmdOutput(record string, isError bool) {
+	const threshold = 15
+	const preview = 10
+	lines := strings.Split(strings.TrimRight(record, "\n"), "\n")
+	if len(lines) > threshold {
+		previewText := strings.Join(lines[:preview], "\n")
+		marker := fmt.Sprintf("[[BILLY_COLLAPSE_%d]]", time.Now().UnixNano())
+		m.collapsedOutputs = append(m.collapsedOutputs, collapsedOutput{
+			marker: marker,
+			full:   record,
+			hidden: len(lines) - preview,
+		})
+		if isError {
+			m.append(errorStyle.Render(previewText) + "\n" + marker + "\n\n")
+		} else {
+			m.append(dimStyle.Render(previewText) + "\n" + marker + "\n\n")
+		}
+	} else if isError {
+		m.append(errorStyle.Render(record) + "\n\n")
+	} else {
+		m.append(dimStyle.Render(record) + "\n")
+	}
+}
+
 // render word-wraps m.content to the current viewport width and scrolls to bottom.
-// Using muesli/reflow which is ANSI-escape-aware, so styled text wraps correctly.
+// Collapse markers are substituted before wrapping; hint line positions are
+// recorded so mouse clicks can identify which block to expand.
 func (m *ChatModel) render() {
 	width := m.viewport.Width - 2
 	if width <= 0 {
 		width = 78
 	}
-	m.viewport.SetContent(wordwrap.String(m.content, width))
+	content := m.content
+	for i := range m.collapsedOutputs {
+		co := &m.collapsedOutputs[i]
+		if co.expanded {
+			content = strings.Replace(content, co.marker, dimStyle.Render(co.full), 1)
+		} else {
+			hint := dimStyle.Render(fmt.Sprintf("  ╰─ [+] %d lines hidden · click or Ctrl+X to expand", co.hidden))
+			content = strings.Replace(content, co.marker, hint, 1)
+		}
+	}
+	wrapped := wordwrap.String(content, width)
+
+	m.viewport.SetContent(wrapped)
+	// Record viewport line positions of each hint for mouse-click targeting
+	lines := strings.Split(wrapped, "\n")
+	for i := range m.collapsedOutputs {
+		if !m.collapsedOutputs[i].expanded {
+			search := fmt.Sprintf("%d lines hidden", m.collapsedOutputs[i].hidden)
+			for lineIdx, line := range lines {
+				if strings.Contains(stripANSI(line), search) {
+					m.collapsedOutputs[i].hintLine = lineIdx
+					break
+				}
+			}
+		}
+	}
 	m.viewport.GotoBottom()
 }
 
@@ -800,15 +1015,15 @@ func (m ChatModel) loadConversation(id string) (ChatModel, tea.Cmd) {
 	m.content = dimStyle.Render(fmt.Sprintf(
 		"  Billy.sh 🐐  —  Resumed conversation  ·  Model: %s\n\n",
 		m.backend.CurrentModel(),
-	))
+	)) + "\n"
 
 	for _, msg := range msgs {
 		m.history = append(m.history, backend.Message{Role: msg.Role, Content: msg.Content})
 		switch msg.Role {
 		case "user":
-			m.content += userStyle.Render("You ▸") + " " + msg.Content + "\n\n"
+			m.content += userStyle.Render("You >") + " " + msg.Content + "\n\n"
 		case "assistant":
-			m.content += assistantStyle.Render("Billy") + "\n" + msg.Content + "\n\n"
+			m.content += assistantStyle.Render("Billy >") + " " + msg.Content + "\n\n"
 		}
 	}
 
@@ -1059,8 +1274,10 @@ Popular models to pull:
 			m.append(dimStyle.Render("Usage: /pull <model-name>\nExample: /pull mistral\n\nPopular models:\n  mistral · llama3 · codellama · phi3 · gemma · neural-chat\n\nFind more at: https://ollama.com/library\n\n"))
 		} else {
 			modelName := parts[1]
-			m.append(dimStyle.Render(fmt.Sprintf("Pulling %s from Ollama library...\n", modelName)))
 			m.waiting = true
+			m.isPulling = true
+			m.pullModelName = modelName
+			m.pullStatus = "starting..."
 			b := m.backend
 			return m, tea.Batch(m.spinner.Tick, func() tea.Msg {
 				ch := make(chan backend.PullProgress, 10)
@@ -1118,7 +1335,7 @@ Popular models to pull:
 		m.content = dimStyle.Render(fmt.Sprintf(
 			"  Billy.sh 🐐  —  Model: %s\n  Type your message and press Enter. Use /help to see commands.\n\n",
 			m.backend.CurrentModel(),
-		))
+		)) + "\n"
 		m.render()
 
 	case "/quit", "/exit":
@@ -1224,7 +1441,7 @@ Popular models to pull:
 			return m, nil
 		}
 		task := strings.Join(parts[1:], " ")
-		m.append(userStyle.Render("You ▸") + fmt.Sprintf(" /suggest %s\n\n", task))
+		m.append(userStyle.Render("You >") + fmt.Sprintf(" /suggest %s\n\n", task))
 		m.waiting = true
 		m.textarea.Reset()
 		return m, tea.Batch(m.spinner.Tick, m.suggestCmd(task))
@@ -1236,7 +1453,7 @@ Popular models to pull:
 			return m, nil
 		}
 		shellCmd := strings.Join(parts[1:], " ")
-		m.append(userStyle.Render("You ▸") + fmt.Sprintf(" /explain %s\n\n", shellCmd))
+		m.append(userStyle.Render("You >") + fmt.Sprintf(" /explain %s\n\n", shellCmd))
 		m.waiting = true
 		m.textarea.Reset()
 		return m, tea.Batch(m.spinner.Tick, m.explainCmd(shellCmd))
@@ -1500,22 +1717,17 @@ func (m ChatModel) promptShellRun(shellCmd string) ChatModel {
 	// Check session-level "always" permission
 	prefix := strings.Fields(shellCmd)[0]
 	if m.shellAlways[prefix] || m.shellAlways["*"] {
-		return m.executeShell(shellCmd)
+		m = m.executeShell(shellCmd)
+		if len(m.cmdQueue) > 0 {
+			return m.promptNextQueuedCmd()
+		}
+		return m
 	}
 
 	m.shellPending = shellCmd
-	permBox := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color("#f59e0b")).
-		Padding(0, 1).
-		Render(fmt.Sprintf(
-			"⚠️  Run this command?\n\n  %s\n\n"+
-				"  [Y] Yes, once   [A] Always this session   [N] No, cancel",
-			lipgloss.NewStyle().Foreground(lipgloss.Color("#38bdf8")).Render(shellCmd),
-		))
-	m.append(permBox + "\n\n")
+	m.shellPickerIdx = 0
 	m.textarea.Reset()
-	m.textarea.Placeholder = "y / a / n ..."
+	m.textarea.Placeholder = "↑↓ select · Enter confirm · Esc cancel"
 	return m
 }
 
@@ -1525,7 +1737,8 @@ func (m ChatModel) executeShell(shellCmd string) ChatModel {
 	m.textarea.Placeholder = "Ask Billy anything... (Enter to send, Ctrl+D to quit)"
 	m.textarea.Reset()
 
-	m.append(dimStyle.Render(fmt.Sprintf("$ %s\n", shellCmd)))
+	cmdStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Bold(true)
+	m.append(cmdStyle.Render("Command >") + " " + dimStyle.Render(shellCmd+"\n\n"))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -1540,10 +1753,16 @@ func (m ChatModel) executeShell(shellCmd string) ChatModel {
 	if output == "" {
 		output = "(no output)"
 	}
+	var record string
 	if err != nil {
-		m.append(errorStyle.Render("Exit error: "+err.Error()+"\n") + output + "\n\n")
+		record = fmt.Sprintf("$ %s\n[exit error: %s]\n%s", shellCmd, err.Error(), output)
+		m.appendCmdOutput(record, true)
 	} else {
-		m.append(output + "\n\n")
+		record = fmt.Sprintf("$ %s\n%s", shellCmd, output)
+		m.appendCmdOutput(record, false)
+	}
+	if m.agentMode {
+		m.pendingCmdOutputs = append(m.pendingCmdOutputs, record)
 	}
 	return m
 }
@@ -1559,7 +1778,7 @@ Rules:
 - When the user asks you to run, create, install, build, or do ANYTHING that requires shell commands, provide the EXACT commands in ` + "```bash" + ` code blocks — never just describe them.
 - When creating files, include the full file content in a code block. Put the filename as a comment on the first line (e.g. // main.go).
 - Break complex tasks into sequential steps. Each step gets its own ` + "```bash" + ` block.
-- After the user approves and runs a command, they will paste the output back. Adjust your next step based on it.
+- After each command runs, the output is automatically fed back to you. Analyze it: if there are errors, diagnose and provide a corrected command. Keep iterating until the task succeeds.
 - Be direct and action-oriented. Minimize prose, maximize commands.
 - If something could be destructive (rm -rf, DROP TABLE, etc), warn clearly before the block.
 
@@ -1621,4 +1840,23 @@ return m
 cmd := m.cmdQueue[0]
 m.cmdQueue = m.cmdQueue[1:]
 return m.promptShellRun(cmd)
+}
+
+// flushCmdOutputs feeds all accumulated shell outputs back to the AI as a user
+// message, triggering a new response so Billy can debug or continue the task.
+func (m ChatModel) flushCmdOutputs() (ChatModel, tea.Cmd) {
+	if len(m.pendingCmdOutputs) == 0 {
+		return m, nil
+	}
+	combined := strings.Join(m.pendingCmdOutputs, "\n\n")
+	m.pendingCmdOutputs = nil
+	m.history = append(m.history, backend.Message{Role: "user", Content: combined})
+	m.tokenEstimate = estimateTokens(m.history)
+	if m.store != nil && m.conversationID != "" {
+		_ = m.store.AddMessage(uuid.New().String(), m.conversationID, "user", combined)
+	}
+	cmdLabelStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Bold(true)
+	m.append(cmdLabelStyle.Render("Command >") + " " + dimStyle.Render("output sent to Billy...\n\n"))
+	m.waiting = true
+	return m, tea.Batch(m.sendChat(), m.spinner.Tick)
 }

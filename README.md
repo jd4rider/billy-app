@@ -171,6 +171,19 @@ Type `/` in the chat to open the **command picker** — scroll through all comma
 | `/memory forget <id>` | Remove a specific memory |
 | `/memory clear` | Wipe all memories |
 
+### Shell & Filesystem
+
+| Command | Description |
+|---|---|
+| `/pwd` | Print current working directory |
+| `/cd <path>` | Change directory — type `/cd ` to open live directory picker |
+| `/ls [path]` | List files and directories (with counts) |
+| `/git` | Show git branch, status, and recent commits |
+| `/suggest <task>` | Suggest the best shell command for a natural-language task |
+| `/explain <cmd>` | Explain what a shell command does, flag by flag |
+
+> **Tip:** Type `/cd ` (with a space) and the picker pops up with all subdirectories. Use ↑↓ to navigate, `..` to go up, or keep typing to filter by name.
+
 ### Shell Execution (Agentic mode)
 
 | Command | Description |
@@ -223,7 +236,7 @@ Billy detects the intent and stores it automatically, then injects relevant memo
 
 ## Modes
 
-The current mode is shown in the status bar at the bottom of the TUI.
+The current mode and working directory are shown in the status bar at the bottom of the TUI.
 
 | Mode | Badge | Behaviour |
 |---|---|---|
@@ -295,11 +308,13 @@ BILLY_MODEL=llama3 BILLY_BACKEND_URL=http://192.168.1.10:11434 billy
 | ✅ | [billy.sh](https://jd4rider.github.io/billy-web) landing page live |
 | ✅ | [Starlight docs site](https://jd4rider.github.io/billy-starlight) |
 | ✅ | One-shot CLI mode (`billy "prompt"`, `billy read/explain/fix/run`) |
-| 🔄 | Context compaction (`/compact`) |
-| 🔄 | Session checkpoints (`/session`) |
+| ✅ | Context compaction (`/compact`) with token estimate in status bar |
+| ✅ | Session checkpoints (`/session`, `/session list`, `/session load`) |
+| ✅ | `/pwd`, `/cd` with live directory autocomplete picker |
+| ✅ | `/ls`, `/git`, `/suggest`, `/explain` shell tools |
+| ✅ | Working directory shown abbreviated in status bar |
 | 🔜 | Teaching mode (`/mode teach`) + admin controls |
 | 🔜 | Groq / custom HTTP / Billy relay backends |
-| 🔜 | Context token counter in status bar |
 | 🔜 | Integration tests |
 | 🔜 | Voice mode (Whisper + Piper TTS) |
 | 🔜 | IDE plugins (VS Code, JetBrains) |
