@@ -509,13 +509,15 @@ func (m ChatModel) View() string {
 		}
 	}
 
-	return lipgloss.JoinVertical(
-		lipgloss.Left,
+	parts := []string{
 		borderStyle.Width(m.width-2).Render(m.viewport.View()),
 		status,
-		m.renderPicker(),
-		borderStyle.Width(m.width-2).Render(m.textarea.View()),
-	)
+	}
+	if picker := m.renderPicker(); picker != "" {
+		parts = append(parts, picker)
+	}
+	parts = append(parts, borderStyle.Width(m.width-2).Render(m.textarea.View()))
+	return lipgloss.JoinVertical(lipgloss.Left, parts...)
 }
 
 // licenseBadge returns a styled tier badge for the status bar.
