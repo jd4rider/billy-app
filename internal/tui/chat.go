@@ -210,6 +210,12 @@ type explainMsg struct {
 	err     error
 }
 
+type shellResultMsg struct {
+	cmd    string
+	output string // formatted "$ cmd\n<stdout+stderr>"
+	isErr  bool   // true if command exited non-zero
+}
+
 // estimateTokens gives a rough token count for the history (4 chars ≈ 1 token).
 func estimateTokens(history []backend.Message) int {
 	total := 0
@@ -266,6 +272,7 @@ type ChatModel struct {
 	collapsedOutputs  []collapsedOutput // folded long command outputs
 	cmdQueue       []string        // AI-suggested commands pending permission
 	agentMode      bool            // true = agentic (default), false = chat only
+	agentSteps     int             // number of command→AI feedback cycles this turn
 	tokenEstimate  int             // rough token count for current history
 	compacted      bool            // true if history has been compacted
 	workDir        string          // current working directory for the session
@@ -410,30 +417,26 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case tea.KeyEnter:
 			pending := m.shellPending
 			m.shellPending = ""
+			m.shellPickerIdx = 0
 			switch m.shellPickerIdx {
 			case 0: // Run once
-				m = m.executeShell(pending)
+				var execCmd tea.Cmd
+				m, execCmd = m.startShellExec(pending)
+				return m, execCmd
 			case 1: // Always this session
 				prefix := strings.Fields(pending)[0]
 				m.shellAlways[prefix] = true
-				m = m.executeShell(pending)
-			case 2: // Cancel
+				var execCmd tea.Cmd
+				m, execCmd = m.startShellExec(pending)
+				return m, execCmd
+			default: // Cancel
 				m.append(dimStyle.Render("Skipped.\n\n"))
 				m.cmdQueue = nil
 				m.pendingCmdOutputs = nil
-			}
-			m.shellPickerIdx = 0
-			if len(m.cmdQueue) > 0 {
-				m = m.promptNextQueuedCmd()
+				m.textarea.Placeholder = "Ask Billy anything... (Enter to send, Ctrl+D to quit)"
+				m.textarea.Reset()
 				return m, nil
 			}
-			if len(m.pendingCmdOutputs) > 0 {
-				m, cmd := m.flushCmdOutputs()
-				return m, cmd
-			}
-			m.textarea.Placeholder = "Ask Billy anything... (Enter to send, Ctrl+D to quit)"
-			m.textarea.Reset()
-			return m, nil
 		case tea.KeyEsc:
 			m.shellPending = ""
 			m.shellPickerIdx = 0
@@ -547,6 +550,7 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.history = append(m.history, backend.Message{Role: "user", Content: input})
 			m.tokenEstimate = estimateTokens(m.history)
 			m.append(userStyle.Render("You >") + " " + input + "\n\n")
+			m.agentSteps = 0 // reset per-turn step counter
 
 			// Persist user message
 			if m.store != nil && m.conversationID != "" {
@@ -605,15 +609,37 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				cmds := extractShellCommands(msg.content)
 				if len(cmds) > 0 {
 					m.cmdQueue = append(m.cmdQueue, cmds...)
-					m = m.promptNextQueuedCmd()
+					var qCmd tea.Cmd
+					m, qCmd = m.promptNextQueuedCmd()
 					// If shellAlways drained the whole queue, flush outputs now
 					if m.shellPending == "" && len(m.cmdQueue) == 0 && len(m.pendingCmdOutputs) > 0 {
 						m, flushCmd := m.flushCmdOutputs()
-						return m, flushCmd
+						return m, tea.Batch(qCmd, flushCmd)
 					}
+					return m, qCmd
 				}
 			}
 		}
+		return m, nil
+
+	case shellResultMsg:
+		m.waiting = false
+		m.appendCmdOutput(msg.output, msg.isErr)
+		if m.agentMode {
+			m.pendingCmdOutputs = append(m.pendingCmdOutputs, msg.output)
+		}
+		// Drain next queued command or flush all outputs back to AI
+		if len(m.cmdQueue) > 0 {
+			var qCmd tea.Cmd
+			m, qCmd = m.promptNextQueuedCmd()
+			return m, qCmd
+		}
+		if len(m.pendingCmdOutputs) > 0 {
+			m, flushCmd := m.flushCmdOutputs()
+			return m, flushCmd
+		}
+		m.textarea.Placeholder = "Ask Billy anything... (Enter to send, Ctrl+D to quit)"
+		m.textarea.Reset()
 		return m, nil
 
 	case spinner.TickMsg:
@@ -735,7 +761,11 @@ func (m ChatModel) View() string {
 	if m.isPulling {
 		status = m.spinner.View() + dimStyle.Render(fmt.Sprintf(" Downloading %s · %s", m.pullModelName, m.pullStatus))
 	} else if m.waiting {
-		status = m.spinner.View() + dimStyle.Render(" Billy is thinking...")
+		if m.agentSteps > 0 {
+			status = m.spinner.View() + dimStyle.Render(fmt.Sprintf(" Step %d — Billy is working...", m.agentSteps))
+		} else {
+			status = m.spinner.View() + dimStyle.Render(" Billy is thinking...")
+		}
 	} else {
 		badge := licenseBadge(m.lic)
 		modeBadge := lipgloss.NewStyle().Foreground(lipgloss.Color("#38bdf8")).Bold(true).Render("[AGENT]")
@@ -1046,7 +1076,14 @@ func (m ChatModel) sendChat() tea.Cmd {
 	}
 	systemPrompt := memory.BuildSystemPrompt(memTexts)
 	if m.agentMode {
-		systemPrompt = agentSystemPrompt + "\n\n" + systemPrompt
+		projectCtx := detectProject(m.workDir)
+		agentCtx := agentSystemPrompt
+		if projectCtx != "" {
+			agentCtx += fmt.Sprintf("\n\nCurrent project: %s\nWorking directory: %s", projectCtx, m.workDir)
+		} else {
+			agentCtx += fmt.Sprintf("\n\nWorking directory: %s", m.workDir)
+		}
+		systemPrompt = agentCtx + "\n\n" + systemPrompt
 	}
 
 	// Prepend system message to history for this request
@@ -1106,7 +1143,7 @@ func (m ChatModel) handleCommand(input string) (ChatModel, tea.Cmd) {
 			return m, nil
 		}
 		shellCmd := strings.Join(parts[1:], " ")
-		return m.promptShellRun(shellCmd), nil
+		return m.promptShellRun(shellCmd)
 
 	case "/mode":
 		if len(parts) < 2 {
@@ -1713,58 +1750,55 @@ func (m ChatModel) activateLicense(key string) ChatModel {
 }
 
 // promptShellRun shows a permission prompt before running a shell command.
-func (m ChatModel) promptShellRun(shellCmd string) ChatModel {
-	// Check session-level "always" permission
+// If the command prefix has session-level "always" permission it starts immediately.
+func (m ChatModel) promptShellRun(shellCmd string) (ChatModel, tea.Cmd) {
 	prefix := strings.Fields(shellCmd)[0]
 	if m.shellAlways[prefix] || m.shellAlways["*"] {
-		m = m.executeShell(shellCmd)
-		if len(m.cmdQueue) > 0 {
-			return m.promptNextQueuedCmd()
-		}
-		return m
+		return m.startShellExec(shellCmd)
 	}
-
 	m.shellPending = shellCmd
 	m.shellPickerIdx = 0
 	m.textarea.Reset()
 	m.textarea.Placeholder = "↑↓ select · Enter confirm · Esc cancel"
-	return m
+	return m, nil
 }
 
-// executeShell runs a shell command and appends its output to the viewport.
-func (m ChatModel) executeShell(shellCmd string) ChatModel {
+// startShellExec kicks off an async shell command and shows a spinner.
+// The result arrives as a shellResultMsg.
+func (m ChatModel) startShellExec(shellCmd string) (ChatModel, tea.Cmd) {
 	m.shellPending = ""
 	m.textarea.Placeholder = "Ask Billy anything... (Enter to send, Ctrl+D to quit)"
 	m.textarea.Reset()
-
 	cmdStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Bold(true)
-	m.append(cmdStyle.Render("Command >") + " " + dimStyle.Render(shellCmd+"\n\n"))
+	m.append(cmdStyle.Render("Command >") + " " + dimStyle.Render(shellCmd+"\n"))
+	m.waiting = true
+	return m, tea.Batch(runShellCmd(shellCmd, m.workDir), m.spinner.Tick)
+}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, "sh", "-c", shellCmd) //nolint:gosec
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &out
-
-	err := cmd.Run()
-	output := out.String()
-	if output == "" {
-		output = "(no output)"
+// runShellCmd executes a shell command in a goroutine and returns the result as a shellResultMsg.
+func runShellCmd(shellCmd, workDir string) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "sh", "-c", shellCmd) //nolint:gosec
+		cmd.Dir = workDir
+		var out bytes.Buffer
+		cmd.Stdout = &out
+		cmd.Stderr = &out
+		err := cmd.Run()
+		output := out.String()
+		if output == "" {
+			output = "(no output)"
+		}
+		isErr := err != nil
+		var record string
+		if isErr {
+			record = fmt.Sprintf("$ %s\n[exit %s]\n%s", shellCmd, err.Error(), output)
+		} else {
+			record = fmt.Sprintf("$ %s\n%s", shellCmd, output)
+		}
+		return shellResultMsg{cmd: shellCmd, output: record, isErr: isErr}
 	}
-	var record string
-	if err != nil {
-		record = fmt.Sprintf("$ %s\n[exit error: %s]\n%s", shellCmd, err.Error(), output)
-		m.appendCmdOutput(record, true)
-	} else {
-		record = fmt.Sprintf("$ %s\n%s", shellCmd, output)
-		m.appendCmdOutput(record, false)
-	}
-	if m.agentMode {
-		m.pendingCmdOutputs = append(m.pendingCmdOutputs, record)
-	}
-	return m
 }
 
 
@@ -1772,30 +1806,19 @@ func (m ChatModel) executeShell(shellCmd string) ChatModel {
 // agentSystemPrompt is prepended when in AGENT mode.
 const agentSystemPrompt = `You are Billy, an agentic AI coding assistant running locally via Ollama.
 
-AGENT MODE is active. Your job is to take action, not just advise.
+AGENT MODE is active. Your job is to take action and iterate, not just advise.
 
 Rules:
-- When the user asks you to run, create, install, build, or do ANYTHING that requires shell commands, provide the EXACT commands in ` + "```bash" + ` code blocks — never just describe them.
-- When creating files, include the full file content in a code block. Put the filename as a comment on the first line (e.g. // main.go).
+- When the user asks you to run, create, install, build, or do ANYTHING requiring shell commands, provide the EXACT commands in ` + "```bash" + ` code blocks — never just describe them.
+- When creating files, use ` + "`cat > filename << 'EOF'`" + ` in a bash block so the file is written automatically.
 - Break complex tasks into sequential steps. Each step gets its own ` + "```bash" + ` block.
-- After each command runs, the output is automatically fed back to you. Analyze it: if there are errors, diagnose and provide a corrected command. Keep iterating until the task succeeds.
-- Be direct and action-oriented. Minimize prose, maximize commands.
-- If something could be destructive (rm -rf, DROP TABLE, etc), warn clearly before the block.
-
-Example good response:
-  Here's how to initialize a Go module:
-  ` + "```bash" + `
-  mkdir myapp && cd myapp
-  go mod init github.com/you/myapp
-  ` + "```" + `
-  Then create your main file:
-  ` + "```bash" + `
-  cat > main.go << 'EOF'
-  package main
-  import "fmt"
-  func main() { fmt.Println("hello") }
-  EOF
-  ` + "```" + ``
+- After each command runs, its output is automatically sent back to you. YOU MUST ANALYZE IT:
+  * If there are errors: diagnose the root cause, then provide a corrected ` + "```bash" + ` block. Keep iterating.
+  * If it succeeded: confirm and move to the next step or declare the task done.
+  * Never stop mid-task and ask the user to run something manually.
+- Use relative paths for files (relative to the working directory shown below).
+- Be concise. Skip preamble. Lead with action.
+- Warn before destructive operations (rm -rf, DROP TABLE, etc).`
 
 // extractShellCommands finds all ```bash / ```sh / ```shell blocks in an AI
 // response and returns each block's trimmed content as a command string.
@@ -1833,19 +1856,25 @@ return cmds
 
 // promptNextQueuedCmd pops the first command from cmdQueue and shows its
 // permission prompt. Call this after a command completes or is skipped.
-func (m ChatModel) promptNextQueuedCmd() ChatModel {
-if len(m.cmdQueue) == 0 {
-return m
-}
-cmd := m.cmdQueue[0]
-m.cmdQueue = m.cmdQueue[1:]
-return m.promptShellRun(cmd)
+func (m ChatModel) promptNextQueuedCmd() (ChatModel, tea.Cmd) {
+	if len(m.cmdQueue) == 0 {
+		return m, nil
+	}
+	cmd := m.cmdQueue[0]
+	m.cmdQueue = m.cmdQueue[1:]
+	return m.promptShellRun(cmd)
 }
 
 // flushCmdOutputs feeds all accumulated shell outputs back to the AI as a user
 // message, triggering a new response so Billy can debug or continue the task.
 func (m ChatModel) flushCmdOutputs() (ChatModel, tea.Cmd) {
 	if len(m.pendingCmdOutputs) == 0 {
+		return m, nil
+	}
+	m.agentSteps++
+	if m.agentSteps > 20 {
+		m.append(errorStyle.Render("⚠  Agent reached 20 steps. Type a follow-up to continue.\n\n"))
+		m.pendingCmdOutputs = nil
 		return m, nil
 	}
 	combined := strings.Join(m.pendingCmdOutputs, "\n\n")
@@ -1856,7 +1885,7 @@ func (m ChatModel) flushCmdOutputs() (ChatModel, tea.Cmd) {
 		_ = m.store.AddMessage(uuid.New().String(), m.conversationID, "user", combined)
 	}
 	cmdLabelStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Bold(true)
-	m.append(cmdLabelStyle.Render("Command >") + " " + dimStyle.Render("output sent to Billy...\n\n"))
+	m.append(cmdLabelStyle.Render(fmt.Sprintf("Step %d", m.agentSteps)) + " " + dimStyle.Render("→ sending output to Billy...\n\n"))
 	m.waiting = true
 	return m, tea.Batch(m.sendChat(), m.spinner.Tick)
 }
