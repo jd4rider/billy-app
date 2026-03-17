@@ -629,6 +629,14 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.newWorkDir != "" && msg.newWorkDir != m.workDir {
 			m.workDir = msg.newWorkDir
 		}
+		// Show ✓ / ✗ status badge before the output
+		if msg.isErr {
+			failStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Bold(true)
+			m.append(failStyle.Render("✗ failed") + "\n")
+		} else {
+			okStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Bold(true)
+			m.append(okStyle.Render("✓ done") + "\n")
+		}
 		m.appendCmdOutput(msg.output, msg.isErr)
 		if m.agentMode {
 			m.pendingCmdOutputs = append(m.pendingCmdOutputs, msg.output)
@@ -767,9 +775,9 @@ func (m ChatModel) View() string {
 		status = m.spinner.View() + dimStyle.Render(fmt.Sprintf(" Downloading %s · %s", m.pullModelName, m.pullStatus))
 	} else if m.waiting {
 		if m.agentSteps > 0 {
-			status = m.spinner.View() + dimStyle.Render(fmt.Sprintf(" Step %d — Billy is working...", m.agentSteps))
+			status = m.spinner.View() + dimStyle.Render(fmt.Sprintf(" Step %d — analyzing output…", m.agentSteps))
 		} else {
-			status = m.spinner.View() + dimStyle.Render(" Billy is thinking...")
+			status = m.spinner.View() + dimStyle.Render(" Billy is thinking…")
 		}
 	} else {
 		badge := licenseBadge(m.lic)
@@ -1775,7 +1783,8 @@ func (m ChatModel) startShellExec(shellCmd string) (ChatModel, tea.Cmd) {
 	m.textarea.Placeholder = "Ask Billy anything... (Enter to send, Ctrl+D to quit)"
 	m.textarea.Reset()
 	cmdStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Bold(true)
-	m.append(cmdStyle.Render("Command >") + " " + dimStyle.Render(shellCmd+"\n"))
+	runningStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("12")) // blue
+	m.append(cmdStyle.Render("⚡ Run") + " " + dimStyle.Render(shellCmd) + "\n" + runningStyle.Render("   ⟳ running…") + "\n\n")
 	m.waiting = true
 	return m, tea.Batch(runShellCmd(shellCmd, m.workDir), m.spinner.Tick)
 }
@@ -1902,8 +1911,8 @@ func (m ChatModel) flushCmdOutputs() (ChatModel, tea.Cmd) {
 	if m.store != nil && m.conversationID != "" {
 		_ = m.store.AddMessage(uuid.New().String(), m.conversationID, "user", combined)
 	}
-	cmdLabelStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Bold(true)
-	m.append(cmdLabelStyle.Render(fmt.Sprintf("Step %d", m.agentSteps)) + " " + dimStyle.Render("→ sending output to Billy...\n\n"))
+	cmdLabelStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("13")).Bold(true) // purple
+	m.append(cmdLabelStyle.Render(fmt.Sprintf("⟳ Step %d — Billy is analyzing output…", m.agentSteps)) + "\n\n")
 	m.waiting = true
 	return m, tea.Batch(m.sendChat(), m.spinner.Tick)
 }
