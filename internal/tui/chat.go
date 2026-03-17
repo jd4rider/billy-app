@@ -2028,44 +2028,18 @@ func runShellCmd(shellCmd, workDir string) tea.Cmd {
 // agentSystemPrompt is prepended when in AGENT mode.
 const agentSystemPrompt = `You are Billy, an agentic AI coding assistant running locally via Ollama.
 
-AGENT MODE is active. You have full shell access. Your job is to build, run,
-debug, and iterate until things actually work — not just scaffold and stop.
+AGENT MODE is active. You have full shell access. Build things, run them, debug them, iterate until they work.
 
-── Task flow ────────────────────────────────────────────────────────────────
-
-For multi-step tasks, start with a brief numbered plan before running anything:
-
-  Plan:
-  1. Initialise the Go module
-  2. Write main.go
-  3. Build the binary
-  4. Run it and verify the output
-
-Execute each step. After each step succeeds, note ✓ and continue.
-
-ALWAYS run and test the final result. "Scaffolding done" is NOT done.
-Done means: you ran it, you saw the output, it works.
-
-Once you have confirmed the thing runs correctly, end with:
-
-  DONE: <one-sentence summary of what was accomplished>
-
-DONE: means "I executed it, I saw working output, the task is complete."
-Do NOT write DONE: after just creating files without running them.
-Do NOT add any ` + "```bash" + ` blocks after the DONE: line.
-
-── Iteration rules ──────────────────────────────────────────────────────────
-
-- Commands go in ` + "```bash" + ` blocks — never describe them without running them.
+Rules:
+- Put every shell command in a ` + "```bash" + ` block — don't describe, execute.
 - Use ` + "`cat > file << 'EOF'`" + ` to write files inside bash blocks.
-- Each step gets its own ` + "```bash" + ` block.
-- After a command runs, its output is sent back to you. React immediately:
-  * Error → diagnose the root cause, provide a corrected bash block, keep going.
-  * Success → confirm ✓ and run the next step. If all steps done, write DONE:.
-- If a command appears in the FAILED COMMANDS log, it already failed — do NOT
-  retry it. Diagnose why and try a completely different approach.
-- Never ask the user to run something manually. You do it.
-- Never stop between steps asking for permission or confirmation.
+- After a command runs, its output is sent back to you:
+  * Error → diagnose root cause, provide a corrected ` + "```bash" + ` block, keep iterating.
+  * Success → confirm ✓ and run the next step.
+- Always build AND run/test the final result to confirm it actually works.
+- When the task is complete and you've seen it working, write: DONE: <one-line summary>
+- If a command appears in the FAILED COMMANDS log, do NOT retry it — try a different approach.
+- Never ask the user to run anything manually — you run it.
 - Warn before destructive operations (rm -rf, DROP TABLE, etc).`
 
 // extractShellCommands finds all ```bash / ```sh / ```shell blocks in an AI
@@ -2125,6 +2099,16 @@ func (m ChatModel) flushCmdOutputs() (ChatModel, tea.Cmd) {
 		m.pendingCmdOutputs = nil
 		return m, nil
 	}
+
+	// Check whether this batch had any failures before we nil the slice.
+	batchHasErrors := false
+	for _, out := range m.pendingCmdOutputs {
+		if strings.Contains(out, "[exit ") {
+			batchHasErrors = true
+			break
+		}
+	}
+
 	combined := strings.Join(m.pendingCmdOutputs, "\n\n")
 	m.pendingCmdOutputs = nil
 
@@ -2142,6 +2126,13 @@ func (m ChatModel) flushCmdOutputs() (ChatModel, tea.Cmd) {
 		}
 		sb.WriteString("=== You MUST try a different approach for any repeated failures above. ===\n\n")
 		combined = sb.String() + combined
+	}
+
+	// When every command in this batch succeeded, nudge the AI to stop if the
+	// task is truly done. This prevents the "re-verify forever" hang while still
+	// letting Billy chain follow-up steps when there is genuine work remaining.
+	if !batchHasErrors {
+		combined += "\n\n(All commands above succeeded. If the task is fully complete and you have seen it working, write DONE: <one-line summary> and stop. Only propose more commands if there is genuine remaining work.)"
 	}
 
 	m.history = append(m.history, backend.Message{Role: "user", Content: combined})
