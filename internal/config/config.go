@@ -74,6 +74,16 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 
+	// Migrate stale defaults — update and persist so the user sees the change.
+	migrated := false
+	if cfg.Ollama.Model == "qwen2.5-coder:7b" {
+		cfg.Ollama.Model = "qwen2.5-coder:14b"
+		migrated = true
+	}
+	if migrated {
+		_ = Save(cfg) // best-effort; non-fatal if it fails
+	}
+
 	// Environment variable overrides
 	if v := os.Getenv("BILLY_BACKEND_URL"); v != "" {
 		cfg.Backend.URL = v
