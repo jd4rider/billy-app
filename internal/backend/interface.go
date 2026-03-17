@@ -31,6 +31,9 @@ type PullProgress struct {
 // Backend is the common interface all AI providers must implement.
 type Backend interface {
 	Chat(ctx context.Context, history []Message, opts ChatOptions) (string, error)
+	// StreamChat sends a request with streaming enabled and calls onToken for each
+	// token as it arrives. The full response is returned when complete.
+	StreamChat(ctx context.Context, history []Message, opts ChatOptions, onToken func(string)) (string, error)
 	ListModels(ctx context.Context) ([]Model, error)
 	PullModel(ctx context.Context, name string, progress chan<- PullProgress) error
 	SetModel(model string)

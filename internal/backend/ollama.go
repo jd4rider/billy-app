@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -70,6 +71,19 @@ type ollamaChatResponse struct {
 
 // Chat sends a conversation history to Ollama and returns the assistant reply.
 func (o *OllamaBackend) Chat(ctx context.Context, history []Message, opts ChatOptions) (string, error) {
+	var full string
+	_, err := o.StreamChat(ctx, history, opts, func(token string) {
+		full += token
+	})
+	if err != nil {
+		return "", err
+	}
+	return full, nil
+}
+
+// StreamChat sends a chat request with streaming enabled and calls onToken for
+// each token fragment as it arrives. Returns the full concatenated response.
+func (o *OllamaBackend) StreamChat(ctx context.Context, history []Message, opts ChatOptions, onToken func(string)) (string, error) {
 	msgs := make([]ollamaMessage, len(history))
 	for i, m := range history {
 		msgs[i] = ollamaMessage{Role: m.Role, Content: m.Content}
@@ -78,7 +92,7 @@ func (o *OllamaBackend) Chat(ctx context.Context, history []Message, opts ChatOp
 	reqBody := ollamaChatRequest{
 		Model:    o.model,
 		Messages: msgs,
-		Stream:   false,
+		Stream:   true,
 		Options: ollamaOptions{
 			Temperature: opts.Temperature,
 			NumPredict:  opts.NumPredict,
@@ -96,22 +110,35 @@ func (o *OllamaBackend) Chat(ctx context.Context, history []Message, opts ChatOp
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := o.client.Do(req)
+	// Streaming — no read timeout; the connection stays open until done/cancelled.
+	streamClient := &http.Client{}
+	resp, err := streamClient.Do(req)
 	if err != nil {
 		return "", classifyError(err, o.baseURL, o.model)
 	}
 	defer resp.Body.Close()
 
-	var result ollamaChatResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", &BillyError{Message: "Unexpected response from Ollama", Hint: "Check that Ollama is up to date"}
+	var full strings.Builder
+	dec := json.NewDecoder(resp.Body)
+	for {
+		var chunk ollamaChatResponse
+		if err := dec.Decode(&chunk); err != nil {
+			break // EOF or cancelled
+		}
+		if chunk.Error != "" {
+			return full.String(), classifyError(errors.New(chunk.Error), o.baseURL, o.model)
+		}
+		if chunk.Message.Content != "" {
+			full.WriteString(chunk.Message.Content)
+			if onToken != nil {
+				onToken(chunk.Message.Content)
+			}
+		}
+		if chunk.Done {
+			break
+		}
 	}
-
-	if result.Error != "" {
-		return "", classifyError(errors.New(result.Error), o.baseURL, o.model)
-	}
-
-	return result.Message.Content, nil
+	return full.String(), nil
 }
 
 type ollamaModelsResponse struct {

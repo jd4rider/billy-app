@@ -217,6 +217,23 @@ type shellResultMsg struct {
 	newWorkDir string // final working directory after any cd operations
 }
 
+// streamTokenMsg carries a single streamed token from the Ollama backend.
+// next is a pre-baked cmd to receive the following token — avoids storing
+// the channel in the model.
+type streamTokenMsg struct {
+	token string
+	done  bool
+	err   error
+	next  tea.Cmd
+}
+
+// agentAttempt records a failed command during an agent chain so Billy can
+// avoid repeating the same mistake in the same session.
+type agentAttempt struct {
+	cmd     string
+	errSnip string // first 400 chars of output
+}
+
 // estimateTokens gives a rough token count for the history (4 chars ≈ 1 token).
 func estimateTokens(history []backend.Message) int {
 	total := 0
@@ -274,9 +291,12 @@ type ChatModel struct {
 	cmdQueue       []string        // AI-suggested commands pending permission
 	agentMode      bool            // true = agentic (default), false = chat only
 	agentSteps     int             // number of command→AI feedback cycles this turn
+	failedCmds     []agentAttempt  // commands that have failed in the current agent chain
 	tokenEstimate  int             // rough token count for current history
 	compacted      bool            // true if history has been compacted
 	workDir        string          // current working directory for the session
+	streaming      bool            // true while streaming a response token by token
+	streamBuf      string          // accumulates streamed tokens until done
 }
 
 // New creates a new ChatModel.
@@ -411,22 +431,28 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		case tea.KeyDown:
-			if m.shellPickerIdx < 2 {
+			if m.shellPickerIdx < 3 {
 				m.shellPickerIdx++
 			}
 			return m, nil
 		case tea.KeyEnter:
 			pending := m.shellPending
+			selectedIdx := m.shellPickerIdx // save before reset
 			m.shellPending = ""
 			m.shellPickerIdx = 0
-			switch m.shellPickerIdx {
+			switch selectedIdx {
 			case 0: // Run once
 				var execCmd tea.Cmd
 				m, execCmd = m.startShellExec(pending)
 				return m, execCmd
-			case 1: // Always this session
+			case 1: // Allow this command type (prefix) for the session
 				prefix := strings.Fields(pending)[0]
 				m.shellAlways[prefix] = true
+				var execCmd tea.Cmd
+				m, execCmd = m.startShellExec(pending)
+				return m, execCmd
+			case 2: // Allow ALL commands for the rest of the session
+				m.shellAlways["*"] = true
 				var execCmd tea.Cmd
 				m, execCmd = m.startShellExec(pending)
 				return m, execCmd
@@ -552,6 +578,7 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.tokenEstimate = estimateTokens(m.history)
 			m.append(userStyle.Render("You >") + " " + input + "\n\n")
 			m.agentSteps = 0 // reset per-turn step counter
+			m.failedCmds = nil
 
 			// Persist user message
 			if m.store != nil && m.conversationID != "" {
@@ -623,6 +650,55 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case streamTokenMsg:
+		if msg.err != nil {
+			m.waiting = false
+			m.streaming = false
+			m.streamBuf = ""
+			m.append(errorStyle.Render("Error: "+msg.err.Error()) + "\n\n")
+			return m, nil
+		}
+		if msg.done {
+			m.waiting = false
+			m.streaming = false
+			content := m.streamBuf
+			m.streamBuf = ""
+			if content != "" {
+				// Finish the streaming line with a blank line
+				m.content += "\n\n"
+				m.render()
+				m.history = append(m.history, backend.Message{Role: "assistant", Content: content})
+				m.tokenEstimate = estimateTokens(m.history)
+				if m.store != nil && m.conversationID != "" {
+					_ = m.store.AddMessage(uuid.New().String(), m.conversationID, "assistant", content)
+				}
+				if m.agentMode {
+					cmds := extractShellCommands(content)
+					if len(cmds) > 0 {
+						m.cmdQueue = append(m.cmdQueue, cmds...)
+						var qCmd tea.Cmd
+						m, qCmd = m.promptNextQueuedCmd()
+						if m.shellPending == "" && len(m.cmdQueue) == 0 && len(m.pendingCmdOutputs) > 0 {
+							m, flushCmd := m.flushCmdOutputs()
+							return m, tea.Batch(qCmd, flushCmd)
+						}
+						return m, qCmd
+					}
+				}
+			}
+			return m, nil
+		}
+		// First token: print the "Billy >" label then start appending
+		if !m.streaming {
+			m.streaming = true
+			m.streamBuf = ""
+			m.append(assistantStyle.Render("Billy >") + " ")
+		}
+		m.streamBuf += msg.token
+		m.content += msg.token
+		m.render()
+		return m, msg.next
+
 	case shellResultMsg:
 		m.waiting = false
 		// Track working directory changes from cd commands inside the shell script
@@ -633,6 +709,14 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.isErr {
 			failStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Bold(true)
 			m.append(failStyle.Render("✗ failed") + "\n")
+			// Record the failure so we can detect if the AI tries the same command again
+			if m.agentMode {
+				snip := msg.output
+				if len(snip) > 400 {
+					snip = snip[:400] + "…"
+				}
+				m.failedCmds = append(m.failedCmds, agentAttempt{cmd: msg.cmd, errSnip: snip})
+			}
 		} else {
 			okStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Bold(true)
 			m.append(okStyle.Render("✓ done") + "\n")
@@ -945,7 +1029,16 @@ func (m ChatModel) renderShellPicker() string {
 	cmdHighlight := lipgloss.NewStyle().Foreground(lipgloss.Color("#38bdf8")).Bold(true)
 	selectedStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#f59e0b")).Bold(true)
 	dimRow := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
-	options := [3]string{"Run once", "Always this session", "Cancel"}
+	prefix := ""
+	if fields := strings.Fields(m.shellPending); len(fields) > 0 {
+		prefix = fields[0]
+	}
+	options := [4]string{
+		"Run once",
+		fmt.Sprintf("Allow '%s' this session", prefix),
+		"✅ Allow ALL commands this session",
+		"🚫 Cancel",
+	}
 	var rows []string
 	rows = append(rows, cmdHighlight.Render("⚡ "+m.shellPending))
 	rows = append(rows, "")
@@ -1109,10 +1202,34 @@ func (m ChatModel) sendChat() tea.Cmd {
 		NumPredict:  m.cfg.Ollama.NumPredict,
 	}
 	b := m.backend
-	return func() tea.Msg {
-		content, err := b.Chat(context.Background(), fullHistory, opts)
-		return chatMsg{content: content, err: err}
+	return startStreamChat(b, fullHistory, opts)
+}
+
+// startStreamChat starts a streaming chat request and returns the first token
+// cmd. Each streamTokenMsg carries a next cmd to receive the following token.
+func startStreamChat(b backend.Backend, history []backend.Message, opts backend.ChatOptions) tea.Cmd {
+	type raw struct {
+		token string
+		done  bool
+		err   error
 	}
+	ch := make(chan raw, 128)
+	go func() {
+		_, err := b.StreamChat(context.Background(), history, opts, func(token string) {
+			ch <- raw{token: token}
+		})
+		if err != nil {
+			ch <- raw{err: err, done: true}
+		} else {
+			ch <- raw{done: true}
+		}
+	}()
+	var listen func() tea.Msg
+	listen = func() tea.Msg {
+		r := <-ch
+		return streamTokenMsg{token: r.token, done: r.done, err: r.err, next: listen}
+	}
+	return listen
 }
 
 // handleCommand routes slash commands.
@@ -1778,10 +1895,30 @@ func (m ChatModel) promptShellRun(shellCmd string) (ChatModel, tea.Cmd) {
 
 // startShellExec kicks off an async shell command and shows a spinner.
 // The result arrives as a shellResultMsg.
+// If the exact command already failed in this agent chain, it is skipped and
+// the AI is told to try a different approach instead.
 func (m ChatModel) startShellExec(shellCmd string) (ChatModel, tea.Cmd) {
 	m.shellPending = ""
 	m.textarea.Placeholder = "Ask Billy anything... (Enter to send, Ctrl+D to quit)"
 	m.textarea.Reset()
+
+	// Dedup: if this exact command already failed, skip and tell Billy.
+	warnStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Bold(true)
+	for _, attempt := range m.failedCmds {
+		if attempt.cmd == shellCmd {
+			m.append(warnStyle.Render("⚠ skipped — command already failed this session") + "\n\n")
+			feedback := fmt.Sprintf(
+				"Command > SKIPPED (duplicate failure): $ %s\n\nThis exact command already failed earlier in this session. You MUST try a completely different approach. Do not retry the same command.",
+				shellCmd,
+			)
+			m.pendingCmdOutputs = append(m.pendingCmdOutputs, feedback)
+			if len(m.cmdQueue) > 0 {
+				return m.promptNextQueuedCmd()
+			}
+			return m.flushCmdOutputs()
+		}
+	}
+
 	cmdStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Bold(true)
 	runningStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("12")) // blue
 	m.append(cmdStyle.Render("⚡ Run") + " " + dimStyle.Render(shellCmd) + "\n" + runningStyle.Render("   ⟳ running…") + "\n\n")
@@ -1840,9 +1977,10 @@ Rules:
 - When creating files, use ` + "`cat > filename << 'EOF'`" + ` in a bash block so the file is written automatically.
 - Break complex tasks into sequential steps. Each step gets its own ` + "```bash" + ` block.
 - After each command runs, its output is automatically sent back to you. YOU MUST ANALYZE IT:
-  * If there are errors: diagnose the root cause, then provide a corrected ` + "```bash" + ` block. Keep iterating.
+  * If there are errors: diagnose the ROOT CAUSE first, then provide a corrected ` + "```bash" + ` block. Keep iterating.
   * If it succeeded: confirm and move to the next step or declare the task done.
   * Never stop mid-task and ask the user to run something manually.
+- CRITICAL — do NOT repeat failed commands: You will receive a "FAILED COMMANDS THIS SESSION" log before each result. If a command appears in that log, it ALREADY FAILED. Do NOT suggest it again. Diagnose WHY it failed and try a fundamentally different approach.
 - Use relative paths for files (relative to the working directory shown below).
 - Be concise. Skip preamble. Lead with action.
 - Warn before destructive operations (rm -rf, DROP TABLE, etc).`
@@ -1906,6 +2044,23 @@ func (m ChatModel) flushCmdOutputs() (ChatModel, tea.Cmd) {
 	}
 	combined := strings.Join(m.pendingCmdOutputs, "\n\n")
 	m.pendingCmdOutputs = nil
+
+	// Prepend a structured attempt log so the AI can see every command that has
+	// already failed — preventing it from suggesting the same fix in a loop.
+	if len(m.failedCmds) > 0 {
+		var sb strings.Builder
+		sb.WriteString("=== FAILED COMMANDS THIS SESSION (do NOT retry any of these) ===\n")
+		for i, a := range m.failedCmds {
+			preview := a.cmd
+			if len(preview) > 120 {
+				preview = preview[:120] + "…"
+			}
+			sb.WriteString(fmt.Sprintf("[%d] $ %s\n%s\n\n", i+1, preview, a.errSnip))
+		}
+		sb.WriteString("=== You MUST try a different approach for any repeated failures above. ===\n\n")
+		combined = sb.String() + combined
+	}
+
 	m.history = append(m.history, backend.Message{Role: "user", Content: combined})
 	m.tokenEstimate = estimateTokens(m.history)
 	if m.store != nil && m.conversationID != "" {
