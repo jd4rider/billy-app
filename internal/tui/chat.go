@@ -297,6 +297,8 @@ type ChatModel struct {
 	workDir        string          // current working directory for the session
 	streaming      bool            // true while streaming a response token by token
 	streamBuf      string          // accumulates streamed tokens until done
+	streamRenderN  int             // token counter for render throttling
+	pendingInput   string          // user input queued while Billy was busy
 }
 
 // New creates a new ChatModel.
@@ -523,9 +525,6 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case tea.KeyCtrlD, tea.KeyCtrlC:
 			return m, tea.Quit
 		case tea.KeyEnter:
-			if m.waiting {
-				return m, nil
-			}
 			input := strings.TrimSpace(m.textarea.Value())
 			if input == "" {
 				return m, nil
@@ -533,60 +532,15 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.textarea.Reset()
 			m.showPicker = false
 
-			if strings.HasPrefix(input, "/") {
-				return m.handleCommand(input)
-			}
-
-			// Freemium limits
-			if (m.lic == nil || m.lic.Free()) && m.msgCount >= 20 {
-				m.append(errorStyle.Render("⛔ Free tier limit reached (20 messages/session).\n\n") +
-					dimStyle.Render("Upgrade to Pro for unlimited conversations:\n  https://billy.sh/upgrade\n\nOr use /license <key> to activate an existing license.\n\n"))
-				m.textarea.Reset()
-				return m, nil
-			}
-			if (m.lic == nil || m.lic.Free()) && m.msgCount == 15 {
-				m.append(dimStyle.Render("⚠️  Approaching free tier limit (15/20 messages). Upgrade to Pro for unlimited: https://billy.sh/upgrade\n\n"))
-			}
-			m.msgCount++
-
-			// Natural language memory detection
-			if fact, ok := memory.DetectAndExtract(input); ok {
-				if m.store != nil {
-					if err := m.store.SaveMemory(uuid.New().String(), fact); err == nil {
-						m.append(assistantStyle.Render("Billy >") + " " +
-							dimStyle.Render(fmt.Sprintf("Got it! I'll remember: \"%s\"\n\n", fact)))
-					} else {
-						m.append(errorStyle.Render("Couldn't save memory: "+err.Error()) + "\n\n")
-					}
-				} else {
-					m.append(dimStyle.Render("(Memory not available — no storage)\n\n"))
-				}
+			// If Billy is busy, queue the input and show a [pending] indicator.
+			if m.waiting {
+				m.pendingInput = input
+				pendingStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Bold(true)
+				m.append(pendingStyle.Render("[pending]") + " " + dimStyle.Render(input) + "\n\n")
 				return m, nil
 			}
 
-			// Ensure a conversation exists in the store
-			if m.store != nil && m.conversationID == "" {
-				m.conversationID = uuid.New().String()
-				title := input
-				if len(title) > 60 {
-					title = title[:60] + "…"
-				}
-				_ = m.store.CreateConversation(m.conversationID, title, m.backend.CurrentModel())
-			}
-
-			m.history = append(m.history, backend.Message{Role: "user", Content: input})
-			m.tokenEstimate = estimateTokens(m.history)
-			m.append(userStyle.Render("You >") + " " + input + "\n\n")
-			m.agentSteps = 0 // reset per-turn step counter
-			m.failedCmds = nil
-
-			// Persist user message
-			if m.store != nil && m.conversationID != "" {
-				_ = m.store.AddMessage(uuid.New().String(), m.conversationID, "user", input)
-			}
-
-			m.waiting = true
-			return m, tea.Batch(m.sendChat(), m.spinner.Tick)
+			return m.dispatchUserInput(input)
 		}
 
 	case progress.FrameMsg:
@@ -656,15 +610,20 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.streaming = false
 			m.streamBuf = ""
 			m.append(errorStyle.Render("Error: "+msg.err.Error()) + "\n\n")
+			if m.pendingInput != "" {
+				input := m.pendingInput
+				m.pendingInput = ""
+				return m.dispatchUserInput(input)
+			}
 			return m, nil
 		}
 		if msg.done {
 			m.waiting = false
 			m.streaming = false
+			m.streamRenderN = 0
 			content := m.streamBuf
 			m.streamBuf = ""
 			if content != "" {
-				// Finish the streaming line with a blank line
 				m.content += "\n\n"
 				m.render()
 				m.history = append(m.history, backend.Message{Role: "assistant", Content: content})
@@ -672,6 +631,32 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.store != nil && m.conversationID != "" {
 					_ = m.store.AddMessage(uuid.New().String(), m.conversationID, "assistant", content)
 				}
+
+				// Detect DONE: — Billy declared the task complete in plain English.
+				// Extract the summary line and show a completion card, then stop the loop.
+				if idx := strings.Index(content, "\nDONE:"); idx != -1 || strings.HasPrefix(content, "DONE:") {
+					m.pendingCmdOutputs = nil
+					m.cmdQueue = nil
+					m.agentSteps = 0
+					doneStart := strings.Index(content, "DONE:")
+					summary := strings.TrimSpace(content[doneStart+5:])
+					if nl := strings.Index(summary, "\n"); nl != -1 {
+						summary = strings.TrimSpace(summary[:nl])
+					}
+					doneStyle := lipgloss.NewStyle().
+						Foreground(lipgloss.Color("#22c55e")).Bold(true).
+						Border(lipgloss.RoundedBorder()).
+						BorderForeground(lipgloss.Color("#22c55e")).
+						Padding(0, 1)
+					m.append(doneStyle.Render("✅ "+summary) + "\n\n")
+					if m.pendingInput != "" {
+						input := m.pendingInput
+						m.pendingInput = ""
+						return m.dispatchUserInput(input)
+					}
+					return m, nil
+				}
+
 				if m.agentMode {
 					cmds := extractShellCommands(content)
 					if len(cmds) > 0 {
@@ -686,17 +671,28 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				}
 			}
+			// No bash blocks and no DONE: — loop stops; pick up any pending input.
+			if m.pendingInput != "" {
+				input := m.pendingInput
+				m.pendingInput = ""
+				return m.dispatchUserInput(input)
+			}
 			return m, nil
 		}
 		// First token: print the "Billy >" label then start appending
 		if !m.streaming {
 			m.streaming = true
 			m.streamBuf = ""
+			m.streamRenderN = 0
 			m.append(assistantStyle.Render("Billy >") + " ")
 		}
 		m.streamBuf += msg.token
 		m.content += msg.token
-		m.render()
+		// Throttle renders to every 5 tokens — keeps keyboard input responsive
+		m.streamRenderN++
+		if m.streamRenderN%5 == 0 {
+			m.render()
+		}
 		return m, msg.next
 
 	case shellResultMsg:
@@ -858,10 +854,14 @@ func (m ChatModel) View() string {
 	if m.isPulling {
 		status = m.spinner.View() + dimStyle.Render(fmt.Sprintf(" Downloading %s · %s", m.pullModelName, m.pullStatus))
 	} else if m.waiting {
+		pendingSuffix := ""
+		if m.pendingInput != "" {
+			pendingSuffix = lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Bold(true).Render(" · [input pending]")
+		}
 		if m.agentSteps > 0 {
-			status = m.spinner.View() + dimStyle.Render(fmt.Sprintf(" Step %d — analyzing output…", m.agentSteps))
+			status = m.spinner.View() + dimStyle.Render(fmt.Sprintf(" Step %d — analyzing output…", m.agentSteps)) + pendingSuffix
 		} else {
-			status = m.spinner.View() + dimStyle.Render(" Billy is thinking…")
+			status = m.spinner.View() + dimStyle.Render(" Billy is thinking…") + pendingSuffix
 		}
 	} else {
 		badge := licenseBadge(m.lic)
@@ -1166,6 +1166,64 @@ func (m ChatModel) loadConversation(id string) (ChatModel, tea.Cmd) {
 	m.render()
 	m.append(dimStyle.Render("── Conversation loaded. Continue from here. ──\n\n"))
 	return m, nil
+}
+
+// dispatchUserInput processes a user-typed message: applies freemium limits,
+// memory detection, persists to store, appends to history, and fires sendChat.
+// Called from KeyEnter directly, or deferred from pendingInput after Billy responds.
+func (m ChatModel) dispatchUserInput(input string) (ChatModel, tea.Cmd) {
+	if strings.HasPrefix(input, "/") {
+		return m.handleCommand(input)
+	}
+
+	// Freemium limits
+	if (m.lic == nil || m.lic.Free()) && m.msgCount >= 20 {
+		m.append(errorStyle.Render("⛔ Free tier limit reached (20 messages/session).\n\n") +
+			dimStyle.Render("Upgrade to Pro for unlimited conversations:\n  https://billy.sh/upgrade\n\nOr use /license <key> to activate an existing license.\n\n"))
+		return m, nil
+	}
+	if (m.lic == nil || m.lic.Free()) && m.msgCount == 15 {
+		m.append(dimStyle.Render("⚠️  Approaching free tier limit (15/20 messages). Upgrade to Pro for unlimited: https://billy.sh/upgrade\n\n"))
+	}
+	m.msgCount++
+
+	// Natural language memory detection
+	if fact, ok := memory.DetectAndExtract(input); ok {
+		if m.store != nil {
+			if err := m.store.SaveMemory(uuid.New().String(), fact); err == nil {
+				m.append(assistantStyle.Render("Billy >") + " " +
+					dimStyle.Render(fmt.Sprintf("Got it! I'll remember: \"%s\"\n\n", fact)))
+			} else {
+				m.append(errorStyle.Render("Couldn't save memory: "+err.Error()) + "\n\n")
+			}
+		} else {
+			m.append(dimStyle.Render("(Memory not available — no storage)\n\n"))
+		}
+		return m, nil
+	}
+
+	// Ensure a conversation exists in the store
+	if m.store != nil && m.conversationID == "" {
+		m.conversationID = uuid.New().String()
+		title := input
+		if len(title) > 60 {
+			title = title[:60] + "…"
+		}
+		_ = m.store.CreateConversation(m.conversationID, title, m.backend.CurrentModel())
+	}
+
+	m.history = append(m.history, backend.Message{Role: "user", Content: input})
+	m.tokenEstimate = estimateTokens(m.history)
+	m.append(userStyle.Render("You >") + " " + input + "\n\n")
+	m.agentSteps = 0
+	m.failedCmds = nil
+
+	if m.store != nil && m.conversationID != "" {
+		_ = m.store.AddMessage(uuid.New().String(), m.conversationID, "user", input)
+	}
+
+	m.waiting = true
+	return m, tea.Batch(m.sendChat(), m.spinner.Tick)
 }
 
 // sendChat fires off a chat request and returns the result as a chatMsg.
@@ -1970,19 +2028,40 @@ func runShellCmd(shellCmd, workDir string) tea.Cmd {
 // agentSystemPrompt is prepended when in AGENT mode.
 const agentSystemPrompt = `You are Billy, an agentic AI coding assistant running locally via Ollama.
 
-AGENT MODE is active. Your job is to take action and iterate, not just advise.
+AGENT MODE is active. Your job is to take action and iterate — not just advise.
 
-Rules:
-- When the user asks you to run, create, install, build, or do ANYTHING requiring shell commands, provide the EXACT commands in ` + "```bash" + ` code blocks — never just describe them.
-- When creating files, use ` + "`cat > filename << 'EOF'`" + ` in a bash block so the file is written automatically.
-- Break complex tasks into sequential steps. Each step gets its own ` + "```bash" + ` block.
-- After each command runs, its output is automatically sent back to you. YOU MUST ANALYZE IT:
-  * If there are errors: diagnose the ROOT CAUSE first, then provide a corrected ` + "```bash" + ` block. Keep iterating.
-  * If it succeeded: confirm and move to the next step or declare the task done.
-  * Never stop mid-task and ask the user to run something manually.
-- CRITICAL — do NOT repeat failed commands: You will receive a "FAILED COMMANDS THIS SESSION" log before each result. If a command appears in that log, it ALREADY FAILED. Do NOT suggest it again. Diagnose WHY it failed and try a fundamentally different approach.
-- Use relative paths for files (relative to the working directory shown below).
-- Be concise. Skip preamble. Lead with action.
+── How to handle tasks ──────────────────────────────────────────────────────
+
+For any task requiring more than one command, start with a brief numbered plan
+in plain English BEFORE running anything. Example:
+
+  Plan:
+  1. Initialise the Go module
+  2. Write main.go
+  3. Build and run
+
+Then execute each step. After each step succeeds, note it with ✓ and move on.
+
+When ALL steps are complete and working, end your response with EXACTLY:
+
+  DONE: <one-sentence summary of what was accomplished>
+
+This signals that the task is finished. Do NOT add any ` + "```bash" + ` blocks after
+the DONE: line. Do NOT run extra verification commands after the task works.
+
+── Rules ────────────────────────────────────────────────────────────────────
+
+- Provide shell commands as ` + "```bash" + ` blocks — never just describe them.
+- Use ` + "`cat > file << 'EOF'`" + ` to write files (so they're created automatically).
+- Each step gets its own ` + "```bash" + ` block.
+- After a command runs, its output is sent back to you. Analyse it:
+  * Errors → diagnose root cause, provide a corrected ` + "```bash" + ` block, keep iterating.
+  * Success → confirm and move to the next step, or write DONE: if all done.
+- NEVER retry a command that already succeeded.
+- NEVER loop back to re-verify things that are already working.
+- CRITICAL: if a command appears in the FAILED COMMANDS log, do NOT suggest it
+  again. Diagnose why it failed and try a fundamentally different approach.
+- Use relative paths (relative to the working directory shown below).
 - Warn before destructive operations (rm -rf, DROP TABLE, etc).`
 
 // extractShellCommands finds all ```bash / ```sh / ```shell blocks in an AI
