@@ -1184,7 +1184,7 @@ Keyboard:
   Ctrl+D / Ctrl+C    Quit
 
 Popular models to pull:
-  qwen2.5-coder:7b · llama3 · codellama · phi3 · gemma · mistral
+  qwen2.5-coder:14b · qwen2.5-coder:7b · llama3 · codellama · phi3 · gemma · mistral
   Full list: https://ollama.com/library
 
 `, modeStr)))

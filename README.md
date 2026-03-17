@@ -93,7 +93,7 @@ go build -o billy ./cmd/billy
 
 ```bash
 # Make sure Ollama is running with a model pulled
-ollama pull qwen2.5-coder:7b   # Billy's default model
+ollama pull qwen2.5-coder:14b   # Billy's default model
 
 # Launch the TUI
 billy
@@ -270,7 +270,7 @@ type = "ollama"
 url  = "http://localhost:11434"
 
 [ollama]
-model       = "qwen2.5-coder:7b"
+model       = "qwen2.5-coder:14b"
 temperature = 0.7
 ```
 
@@ -278,7 +278,7 @@ temperature = 0.7
 |---|---|---|
 | `backend.type` | `ollama` | Backend (`ollama` — more coming: groq, custom) |
 | `backend.url` | `http://localhost:11434` | Ollama server URL |
-| `ollama.model` | `qwen2.5-coder:7b` | Default model |
+| `ollama.model` | `qwen2.5-coder:14b` | Default model |
 | `ollama.temperature` | `0.7` | Sampling temperature (0.0–1.0) |
 
 Environment variable overrides:

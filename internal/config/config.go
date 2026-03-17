@@ -44,7 +44,7 @@ func DefaultConfig() *Config {
 			URL:  "http://localhost:11434",
 		},
 		Ollama: OllamaConfig{
-			Model:       "qwen2.5-coder:7b",
+			Model:       "qwen2.5-coder:14b",
 			Temperature: 0.7,
 			NumPredict:  2048,
 		},
