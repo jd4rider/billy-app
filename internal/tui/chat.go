@@ -211,9 +211,10 @@ type explainMsg struct {
 }
 
 type shellResultMsg struct {
-	cmd    string
-	output string // formatted "$ cmd\n<stdout+stderr>"
-	isErr  bool   // true if command exited non-zero
+	cmd        string
+	output     string // formatted "$ cmd\n<stdout+stderr>"
+	isErr      bool   // true if command exited non-zero
+	newWorkDir string // final working directory after any cd operations
 }
 
 // estimateTokens gives a rough token count for the history (4 chars ≈ 1 token).
@@ -624,6 +625,10 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case shellResultMsg:
 		m.waiting = false
+		// Track working directory changes from cd commands inside the shell script
+		if msg.newWorkDir != "" && msg.newWorkDir != m.workDir {
+			m.workDir = msg.newWorkDir
+		}
 		m.appendCmdOutput(msg.output, msg.isErr)
 		if m.agentMode {
 			m.pendingCmdOutputs = append(m.pendingCmdOutputs, msg.output)
@@ -1776,18 +1781,32 @@ func (m ChatModel) startShellExec(shellCmd string) (ChatModel, tea.Cmd) {
 }
 
 // runShellCmd executes a shell command in a goroutine and returns the result as a shellResultMsg.
+// It appends a pwd marker so cd operations inside the command are tracked and workDir stays correct.
 func runShellCmd(shellCmd, workDir string) tea.Cmd {
+	const pwdMarker = "\n__BILLY_PWD__:"
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 		defer cancel()
-		cmd := exec.CommandContext(ctx, "sh", "-c", shellCmd) //nolint:gosec
+		// Append pwd capture so cd changes inside shellCmd are reflected back.
+		wrapped := shellCmd + "\nprintf '" + pwdMarker + "%s' \"$(pwd)\""
+		cmd := exec.CommandContext(ctx, "sh", "-c", wrapped) //nolint:gosec
 		cmd.Dir = workDir
 		var out bytes.Buffer
 		cmd.Stdout = &out
 		cmd.Stderr = &out
 		err := cmd.Run()
-		output := out.String()
-		if output == "" {
+
+		// Parse out the __BILLY_PWD__ marker and final working directory.
+		rawOutput := out.String()
+		newWorkDir := workDir
+		cleanOutput := rawOutput
+		if idx := strings.LastIndex(rawOutput, "\n__BILLY_PWD__:"); idx != -1 {
+			newWorkDir = strings.TrimSpace(rawOutput[idx+len("\n__BILLY_PWD__:"):])
+			cleanOutput = strings.TrimRight(rawOutput[:idx], "\n")
+		}
+
+		output := cleanOutput
+		if strings.TrimSpace(output) == "" {
 			output = "(no output)"
 		}
 		isErr := err != nil
@@ -1797,10 +1816,9 @@ func runShellCmd(shellCmd, workDir string) tea.Cmd {
 		} else {
 			record = fmt.Sprintf("$ %s\n%s", shellCmd, output)
 		}
-		return shellResultMsg{cmd: shellCmd, output: record, isErr: isErr}
+		return shellResultMsg{cmd: shellCmd, output: record, isErr: isErr, newWorkDir: newWorkDir}
 	}
 }
-
 
 
 // agentSystemPrompt is prepended when in AGENT mode.
