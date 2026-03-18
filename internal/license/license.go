@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-const PublicKeyB64 = "lqE+Vy7TsRUnObQu32V93SNU/Gq2hCOp1mOg28JfO+g="
+const PublicKeyB64 = "32VSkgJmjTjRKpk+XSszYWMGO876wpa6frghFEYkQ50="
 
 type Tier string
 
