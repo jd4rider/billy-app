@@ -14,6 +14,7 @@ import (
 
 	"github.com/jonathanforrider/billy/internal/backend"
 	"github.com/jonathanforrider/billy/internal/config"
+	"github.com/jonathanforrider/billy/internal/license"
 	"github.com/jonathanforrider/billy/internal/memory"
 	"github.com/jonathanforrider/billy/internal/store"
 )
@@ -35,7 +36,11 @@ func Run(args []string) error {
 		}
 	}
 
-	b := backend.NewOllama(cfg.Backend.URL, cfg.Ollama.Model)
+	lic, _ := license.LoadCached(s)
+	b, err := backend.NewFromConfig(cfg, lic)
+	if err != nil {
+		return err
+	}
 
 	subcommand := strings.ToLower(args[0])
 	switch subcommand {

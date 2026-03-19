@@ -10,6 +10,7 @@ import (
 type BackendConfig struct {
 	Type   string `toml:"type"`
 	URL    string `toml:"url"`
+	Model  string `toml:"model"`
 	APIKey string `toml:"api_key"`
 }
 
@@ -90,11 +91,17 @@ func Load() (*Config, error) {
 	if v := os.Getenv("BILLY_BACKEND_TYPE"); v != "" {
 		cfg.Backend.Type = v
 	}
+	if v := os.Getenv("BILLY_BACKEND_MODEL"); v != "" {
+		cfg.Backend.Model = v
+	}
 	if v := os.Getenv("BILLY_API_KEY"); v != "" {
 		cfg.Backend.APIKey = v
 	}
 	if v := os.Getenv("BILLY_MODEL"); v != "" {
 		cfg.Ollama.Model = v
+		if cfg.Backend.Model == "" {
+			cfg.Backend.Model = v
+		}
 	}
 
 	return cfg, nil

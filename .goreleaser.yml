@@ -44,7 +44,7 @@ nfpms:
     vendor: "jd4rider"
     homepage: "https://github.com/jd4rider/billy-app"
     maintainer: "jd4rider <noreply@github.com>"
-    description: "Local AI coding assistant powered by Ollama. No subscription required."
+    description: "Local-first AI coding assistant with Ollama and custom endpoints."
     license: MIT
     formats:
       - deb
@@ -68,7 +68,7 @@ brews:
       token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
     directory: Formula
     homepage: "https://github.com/jd4rider/billy-app"
-    description: "Local AI coding assistant powered by Ollama. No subscription required."
+    description: "Local-first AI coding assistant with Ollama and custom endpoints."
     license: MIT
     test: |
       system "#{bin}/billy", "--version"
@@ -83,7 +83,7 @@ scoops:
       token: "{{ .Env.SCOOP_BUCKET_TOKEN }}"
     directory: bucket
     homepage: "https://github.com/jd4rider/billy-app"
-    description: "Local AI coding assistant powered by Ollama. No subscription required."
+    description: "Local-first AI coding assistant with Ollama and custom endpoints."
     license: MIT
 
 release:
@@ -93,9 +93,9 @@ release:
   prerelease: auto
   name_template: "{{.Tag}}"
   header: |
-    ## ⚠️ Billy.sh {{.Tag}} — Pre-Alpha
+    ## ⚠️ Billy.sh {{.Tag}} — Alpha
 
-    This is pre-alpha software. Expect rough edges and breaking changes.
+    This is alpha software. Expect rough edges and occasional breaking changes.
 
     ### Variants
     | Build | Ollama | Size |
