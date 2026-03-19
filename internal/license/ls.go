@@ -15,11 +15,18 @@ const lsAPIBase = "https://api.lemonsqueezy.com/v1/licenses"
 
 // VariantTier maps LemonSqueezy variant IDs to license tiers.
 var VariantTier = map[int]Tier{
+	// Test-mode variants
 	1408429: TierPro,
 	1408393: TierPremium,
 	1408425: TierTeam,
 	1408426: TierTeam,
 	1408428: TierTeam,
+	// Live-mode variants
+	1420712: TierPro,
+	1420713: TierPremium,
+	1420715: TierTeam,
+	1420716: TierTeam,
+	1420717: TierTeam,
 }
 
 // VariantSeats maps team variant IDs to seat counts.
@@ -27,6 +34,9 @@ var VariantSeats = map[int]int{
 	1408425: 5,
 	1408426: 10,
 	1408428: 25,
+	1420715: 5,
+	1420716: 10,
+	1420717: 25,
 }
 
 // Activation is the encrypted blob stored locally after a successful activation.
