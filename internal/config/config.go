@@ -29,11 +29,10 @@ type StorageConfig struct {
 }
 
 type Config struct {
-	Backend    BackendConfig `toml:"backend"`
-	Ollama     OllamaConfig  `toml:"ollama"`
-	UI         UIConfig      `toml:"ui"`
-	Storage    StorageConfig `toml:"storage"`
-	LicenseKey string        `toml:"license_key"`
+	Backend BackendConfig `toml:"backend"`
+	Ollama  OllamaConfig  `toml:"ollama"`
+	UI      UIConfig      `toml:"ui"`
+	Storage StorageConfig `toml:"storage"`
 }
 
 func DefaultConfig() *Config {

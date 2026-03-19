@@ -61,6 +61,7 @@ var commandList = []pickerItem{
 	{"/cd", "Change working directory (autocompletes paths)", true},
 	{"/clear", "Clear the current chat", false},
 	{"/compact", "Summarize and compress context", false},
+	{"/deactivate", "Deactivate license on this machine (frees your seat)", false},
 	{"/explain", "Explain what a shell command does", true},
 	{"/git", "Show git status and recent commits", false},
 	{"/help", "Show all commands", false},
@@ -210,28 +211,33 @@ type explainMsg struct {
 	err     error
 }
 
-type shellResultMsg struct {
-	cmd        string
-	output     string // formatted "$ cmd\n<stdout+stderr>"
-	isErr      bool   // true if command exited non-zero
-	newWorkDir string // final working directory after any cd operations
+type licenseActivatedMsg struct {
+	lic        *license.License
+	instanceID string
+	err        error
 }
 
-// streamTokenMsg carries a single streamed token from the Ollama backend.
-// next is a pre-baked cmd to receive the following token — avoids storing
-// the channel in the model.
-type streamTokenMsg struct {
-	token string
-	done  bool
-	err   error
-	next  tea.Cmd
+type licenseValidatedMsg struct {
+	lic *license.License
+	err error
 }
 
-// agentAttempt records a failed command during an agent chain so Billy can
-// avoid repeating the same mistake in the same session.
-type agentAttempt struct {
-	cmd     string
-	errSnip string // first 400 chars of output
+func activateLicenseCmd(newKey, oldKey, oldInstanceID string) tea.Cmd {
+	return func() tea.Msg {
+		// Best-effort deactivate old key first to free the seat
+		if oldKey != "" && oldInstanceID != "" {
+			_ = license.Deactivate(oldKey, oldInstanceID)
+		}
+		lic, instanceID, err := license.Activate(newKey, license.InstanceName())
+		return licenseActivatedMsg{lic: lic, instanceID: instanceID, err: err}
+	}
+}
+
+func validateLicenseCmd(key, instanceID string) tea.Cmd {
+	return func() tea.Msg {
+		lic, err := license.Validate(key, instanceID)
+		return licenseValidatedMsg{lic: lic, err: err}
+	}
 }
 
 // estimateTokens gives a rough token count for the history (4 chars ≈ 1 token).
@@ -278,7 +284,11 @@ type ChatModel struct {
 	showPicker     bool
 	pickerItems    []pickerItem
 	pickerIdx      int
-	activating     bool            // true while /activate key-entry prompt is shown
+	activating               bool            // true while /activate key-entry prompt is shown
+	pendingActivationKey     string          // key being activated (for licenseActivatedMsg handler)
+	pendingValidation        bool            // trigger background re-validation on Init
+	pendingValidationKey     string
+	pendingValidationInstID  string
 	shellPending   string          // shell command awaiting user permission
 	shellAlways    map[string]bool // session-level "always run" prefixes
 	shellPickerIdx    int              // 0=Run once, 1=Always, 2=Cancel
@@ -290,15 +300,9 @@ type ChatModel struct {
 	collapsedOutputs  []collapsedOutput // folded long command outputs
 	cmdQueue       []string        // AI-suggested commands pending permission
 	agentMode      bool            // true = agentic (default), false = chat only
-	agentSteps     int             // number of command→AI feedback cycles this turn
-	failedCmds     []agentAttempt  // commands that have failed in the current agent chain
 	tokenEstimate  int             // rough token count for current history
 	compacted      bool            // true if history has been compacted
 	workDir        string          // current working directory for the session
-	streaming      bool            // true while streaming a response token by token
-	streamBuf      string          // accumulates streamed tokens until done
-	streamRenderN  int             // token counter for render throttling
-	pendingInput   string          // user input queued while Billy was busy
 }
 
 // New creates a new ChatModel.
@@ -343,17 +347,17 @@ func New(cfg *config.Config, b backend.Backend, s *store.Store) ChatModel {
 		m.workDir = wd
 	}
 
-	// Load license — SQLite encrypted store takes priority, config.toml is fallback
+	// Load license from encrypted activation cache; re-validate in background if stale
 	if s != nil {
-		if keyBytes, err := s.GetEncrypted("license_key"); err == nil && len(keyBytes) > 0 {
-			if lic, err := license.Parse(string(keyBytes)); err == nil {
-				m.lic = lic
+		if actBytes, err := s.GetEncrypted("ls_activation"); err == nil && len(actBytes) > 0 {
+			if act, err := license.UnmarshalActivation(actBytes); err == nil {
+				m.lic = act.ToLicense()
+				if time.Since(act.ValidatedAt) > 7*24*time.Hour {
+					m.pendingValidation = true
+					m.pendingValidationKey = act.Key
+					m.pendingValidationInstID = act.InstanceID
+				}
 			}
-		}
-	}
-	if m.lic == nil && cfg.LicenseKey != "" {
-		if lic, err := license.Parse(cfg.LicenseKey); err == nil {
-			m.lic = lic
 		}
 	}
 
@@ -361,6 +365,9 @@ func New(cfg *config.Config, b backend.Backend, s *store.Store) ChatModel {
 }
 
 func (m ChatModel) Init() tea.Cmd {
+	if m.pendingValidation {
+		return tea.Batch(textarea.Blink, validateLicenseCmd(m.pendingValidationKey, m.pendingValidationInstID))
+	}
 	return textarea.Blink
 }
 
@@ -418,7 +425,22 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.activating = false
 			m.textarea.Placeholder = "Ask Billy anything... (Enter to send, Ctrl+D to quit)"
 			m.textarea.Reset()
-			return m.activateLicense(key), nil
+			if key == "" {
+				m.append(errorStyle.Render("❌ No key entered. Use /activate to try again.\n\n"))
+				return m, nil
+			}
+			// Read any existing activation so we can deactivate it first (frees old seat)
+			var oldKey, oldInstID string
+			if m.store != nil {
+				if actBytes, err := m.store.GetEncrypted("ls_activation"); err == nil && len(actBytes) > 0 {
+					if act, err := license.UnmarshalActivation(actBytes); err == nil {
+						oldKey, oldInstID = act.Key, act.InstanceID
+					}
+				}
+			}
+			m.pendingActivationKey = key
+			m.append(dimStyle.Render("🔄 Contacting activation server...\n\n"))
+			return m, activateLicenseCmd(key, oldKey, oldInstID)
 		}
 		m.textarea, taCmd = m.textarea.Update(msg)
 		return m, taCmd
@@ -433,39 +455,37 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		case tea.KeyDown:
-			if m.shellPickerIdx < 3 {
+			if m.shellPickerIdx < 2 {
 				m.shellPickerIdx++
 			}
 			return m, nil
 		case tea.KeyEnter:
 			pending := m.shellPending
-			selectedIdx := m.shellPickerIdx // save before reset
 			m.shellPending = ""
-			m.shellPickerIdx = 0
-			switch selectedIdx {
+			switch m.shellPickerIdx {
 			case 0: // Run once
-				var execCmd tea.Cmd
-				m, execCmd = m.startShellExec(pending)
-				return m, execCmd
-			case 1: // Allow this command type (prefix) for the session
+				m = m.executeShell(pending)
+			case 1: // Always this session
 				prefix := strings.Fields(pending)[0]
 				m.shellAlways[prefix] = true
-				var execCmd tea.Cmd
-				m, execCmd = m.startShellExec(pending)
-				return m, execCmd
-			case 2: // Allow ALL commands for the rest of the session
-				m.shellAlways["*"] = true
-				var execCmd tea.Cmd
-				m, execCmd = m.startShellExec(pending)
-				return m, execCmd
-			default: // Cancel
+				m = m.executeShell(pending)
+			case 2: // Cancel
 				m.append(dimStyle.Render("Skipped.\n\n"))
 				m.cmdQueue = nil
 				m.pendingCmdOutputs = nil
-				m.textarea.Placeholder = "Ask Billy anything... (Enter to send, Ctrl+D to quit)"
-				m.textarea.Reset()
+			}
+			m.shellPickerIdx = 0
+			if len(m.cmdQueue) > 0 {
+				m = m.promptNextQueuedCmd()
 				return m, nil
 			}
+			if len(m.pendingCmdOutputs) > 0 {
+				m, cmd := m.flushCmdOutputs()
+				return m, cmd
+			}
+			m.textarea.Placeholder = "Ask Billy anything... (Enter to send, Ctrl+D to quit)"
+			m.textarea.Reset()
+			return m, nil
 		case tea.KeyEsc:
 			m.shellPending = ""
 			m.shellPickerIdx = 0
@@ -525,6 +545,9 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case tea.KeyCtrlD, tea.KeyCtrlC:
 			return m, tea.Quit
 		case tea.KeyEnter:
+			if m.waiting {
+				return m, nil
+			}
 			input := strings.TrimSpace(m.textarea.Value())
 			if input == "" {
 				return m, nil
@@ -532,15 +555,58 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.textarea.Reset()
 			m.showPicker = false
 
-			// If Billy is busy, queue the input and show a [pending] indicator.
-			if m.waiting {
-				m.pendingInput = input
-				pendingStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Bold(true)
-				m.append(pendingStyle.Render("[pending]") + " " + dimStyle.Render(input) + "\n\n")
+			if strings.HasPrefix(input, "/") {
+				return m.handleCommand(input)
+			}
+
+			// Freemium limits
+			if (m.lic == nil || m.lic.Free()) && m.msgCount >= 20 {
+				m.append(errorStyle.Render("⛔ Free tier limit reached (20 messages/session).\n\n") +
+					dimStyle.Render("Upgrade to Pro for unlimited conversations:\n  https://billy.sh/upgrade\n\nOr use /license <key> to activate an existing license.\n\n"))
+				m.textarea.Reset()
+				return m, nil
+			}
+			if (m.lic == nil || m.lic.Free()) && m.msgCount == 15 {
+				m.append(dimStyle.Render("⚠️  Approaching free tier limit (15/20 messages). Upgrade to Pro for unlimited: https://billy.sh/upgrade\n\n"))
+			}
+			m.msgCount++
+
+			// Natural language memory detection
+			if fact, ok := memory.DetectAndExtract(input); ok {
+				if m.store != nil {
+					if err := m.store.SaveMemory(uuid.New().String(), fact); err == nil {
+						m.append(assistantStyle.Render("Billy >") + " " +
+							dimStyle.Render(fmt.Sprintf("Got it! I'll remember: \"%s\"\n\n", fact)))
+					} else {
+						m.append(errorStyle.Render("Couldn't save memory: "+err.Error()) + "\n\n")
+					}
+				} else {
+					m.append(dimStyle.Render("(Memory not available — no storage)\n\n"))
+				}
 				return m, nil
 			}
 
-			return m.dispatchUserInput(input)
+			// Ensure a conversation exists in the store
+			if m.store != nil && m.conversationID == "" {
+				m.conversationID = uuid.New().String()
+				title := input
+				if len(title) > 60 {
+					title = title[:60] + "…"
+				}
+				_ = m.store.CreateConversation(m.conversationID, title, m.backend.CurrentModel())
+			}
+
+			m.history = append(m.history, backend.Message{Role: "user", Content: input})
+			m.tokenEstimate = estimateTokens(m.history)
+			m.append(userStyle.Render("You >") + " " + input + "\n\n")
+
+			// Persist user message
+			if m.store != nil && m.conversationID != "" {
+				_ = m.store.AddMessage(uuid.New().String(), m.conversationID, "user", input)
+			}
+
+			m.waiting = true
+			return m, tea.Batch(m.sendChat(), m.spinner.Tick)
 		}
 
 	case progress.FrameMsg:
@@ -591,148 +657,15 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				cmds := extractShellCommands(msg.content)
 				if len(cmds) > 0 {
 					m.cmdQueue = append(m.cmdQueue, cmds...)
-					var qCmd tea.Cmd
-					m, qCmd = m.promptNextQueuedCmd()
+					m = m.promptNextQueuedCmd()
 					// If shellAlways drained the whole queue, flush outputs now
 					if m.shellPending == "" && len(m.cmdQueue) == 0 && len(m.pendingCmdOutputs) > 0 {
 						m, flushCmd := m.flushCmdOutputs()
-						return m, tea.Batch(qCmd, flushCmd)
-					}
-					return m, qCmd
-				}
-			}
-		}
-		return m, nil
-
-	case streamTokenMsg:
-		if msg.err != nil {
-			m.waiting = false
-			m.streaming = false
-			m.streamBuf = ""
-			m.append(errorStyle.Render("Error: "+msg.err.Error()) + "\n\n")
-			if m.pendingInput != "" {
-				input := m.pendingInput
-				m.pendingInput = ""
-				return m.dispatchUserInput(input)
-			}
-			return m, nil
-		}
-		if msg.done {
-			m.waiting = false
-			m.streaming = false
-			m.streamRenderN = 0
-			content := m.streamBuf
-			m.streamBuf = ""
-			if content != "" {
-				m.content += "\n\n"
-				m.render()
-				m.history = append(m.history, backend.Message{Role: "assistant", Content: content})
-				m.tokenEstimate = estimateTokens(m.history)
-				if m.store != nil && m.conversationID != "" {
-					_ = m.store.AddMessage(uuid.New().String(), m.conversationID, "assistant", content)
-				}
-
-				// Detect DONE: — Billy declared the task complete in plain English.
-				// Extract the summary line and show a completion card, then stop the loop.
-				if idx := strings.Index(content, "\nDONE:"); idx != -1 || strings.HasPrefix(content, "DONE:") {
-					m.pendingCmdOutputs = nil
-					m.cmdQueue = nil
-					m.agentSteps = 0
-					doneStart := strings.Index(content, "DONE:")
-					summary := strings.TrimSpace(content[doneStart+5:])
-					if nl := strings.Index(summary, "\n"); nl != -1 {
-						summary = strings.TrimSpace(summary[:nl])
-					}
-					doneStyle := lipgloss.NewStyle().
-						Foreground(lipgloss.Color("#22c55e")).Bold(true).
-						Border(lipgloss.RoundedBorder()).
-						BorderForeground(lipgloss.Color("#22c55e")).
-						Padding(0, 1)
-					m.append(doneStyle.Render("✅ "+summary) + "\n\n")
-					if m.pendingInput != "" {
-						input := m.pendingInput
-						m.pendingInput = ""
-						return m.dispatchUserInput(input)
-					}
-					return m, nil
-				}
-
-				if m.agentMode {
-					cmds := extractShellCommands(content)
-					if len(cmds) > 0 {
-						m.cmdQueue = append(m.cmdQueue, cmds...)
-						var qCmd tea.Cmd
-						m, qCmd = m.promptNextQueuedCmd()
-						if m.shellPending == "" && len(m.cmdQueue) == 0 && len(m.pendingCmdOutputs) > 0 {
-							m, flushCmd := m.flushCmdOutputs()
-							return m, tea.Batch(qCmd, flushCmd)
-						}
-						return m, qCmd
+						return m, flushCmd
 					}
 				}
 			}
-			// No bash blocks and no DONE: — loop stops; pick up any pending input.
-			if m.pendingInput != "" {
-				input := m.pendingInput
-				m.pendingInput = ""
-				return m.dispatchUserInput(input)
-			}
-			return m, nil
 		}
-		// First token: print the "Billy >" label then start appending
-		if !m.streaming {
-			m.streaming = true
-			m.streamBuf = ""
-			m.streamRenderN = 0
-			m.append(assistantStyle.Render("Billy >") + " ")
-		}
-		m.streamBuf += msg.token
-		m.content += msg.token
-		// Throttle renders to every 5 tokens — keeps keyboard input responsive
-		m.streamRenderN++
-		if m.streamRenderN%5 == 0 {
-			m.render()
-		}
-		return m, msg.next
-
-	case shellResultMsg:
-		m.waiting = false
-		// Track working directory changes from cd commands inside the shell script
-		if msg.newWorkDir != "" && msg.newWorkDir != m.workDir {
-			m.workDir = msg.newWorkDir
-		}
-		// Show ✓ / ✗ status badge before the output
-		if msg.isErr {
-			failStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Bold(true)
-			m.append(failStyle.Render("✗ failed") + "\n")
-			// Record the failure so we can detect if the AI tries the same command again
-			if m.agentMode {
-				snip := msg.output
-				if len(snip) > 400 {
-					snip = snip[:400] + "…"
-				}
-				m.failedCmds = append(m.failedCmds, agentAttempt{cmd: msg.cmd, errSnip: snip})
-			}
-		} else {
-			okStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Bold(true)
-			m.append(okStyle.Render("✓ done") + "\n")
-		}
-		m.appendCmdOutput(msg.output, msg.isErr)
-		if m.agentMode {
-			m.pendingCmdOutputs = append(m.pendingCmdOutputs, msg.output)
-		}
-		// Drain next queued command or flush all outputs back to AI
-		if len(m.cmdQueue) > 0 {
-			var qCmd tea.Cmd
-			m, qCmd = m.promptNextQueuedCmd()
-			return m, qCmd
-		}
-		if len(m.pendingCmdOutputs) > 0 {
-			m, flushCmd := m.flushCmdOutputs()
-			return m, flushCmd
-		}
-		m.textarea.Placeholder = "Ask Billy anything... (Enter to send, Ctrl+D to quit)"
-		m.textarea.Reset()
 		return m, nil
 
 	case spinner.TickMsg:
@@ -801,6 +734,53 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.append(assistantStyle.Render("Billy >") + " " + wordwrap.String(msg.content, m.viewport.Width-4) + "\n\n")
 		}
 		return m, nil
+
+	case licenseActivatedMsg:
+		if msg.err != nil {
+			m.append(errorStyle.Render("❌ Activation failed: " + msg.err.Error() + "\n\n"))
+			return m, nil
+		}
+		act := license.Activation{
+			Key:         m.pendingActivationKey,
+			InstanceID:  msg.instanceID,
+			Tier:        msg.lic.Tier,
+			Seats:       msg.lic.Seats,
+			Email:       msg.lic.Email,
+			ValidatedAt: time.Now(),
+		}
+		if actBytes, err := act.Marshal(); err == nil && m.store != nil {
+			_ = m.store.SetEncrypted("ls_activation", actBytes)
+		}
+		m.lic = msg.lic
+		seatsNote := ""
+		if msg.lic.Seats > 0 {
+			seatsNote = fmt.Sprintf(" (%d seats)", msg.lic.Seats)
+		}
+		m.append(dimStyle.Render(fmt.Sprintf(
+			"✅ License activated! Welcome to %s tier%s 🎉\nActivation stored securely on this machine.\n\n",
+			strings.ToUpper(string(msg.lic.EffectiveTier())), seatsNote,
+		)))
+		return m, nil
+
+	case licenseValidatedMsg:
+		if msg.err != nil {
+			m.append(errorStyle.Render("⚠️  License re-validation failed: " + msg.err.Error() + "\n\n"))
+			return m, nil
+		}
+		// Refresh cached activation timestamp
+		if m.store != nil {
+			if actBytes, err := m.store.GetEncrypted("ls_activation"); err == nil && len(actBytes) > 0 {
+				if act, err := license.UnmarshalActivation(actBytes); err == nil {
+					act.ValidatedAt = time.Now()
+					act.Tier = msg.lic.Tier
+					if newBytes, err := act.Marshal(); err == nil {
+						_ = m.store.SetEncrypted("ls_activation", newBytes)
+					}
+				}
+			}
+		}
+		m.lic = msg.lic
+		return m, nil
 	}
 
 	m.textarea, taCmd = m.textarea.Update(msg)
@@ -854,15 +834,7 @@ func (m ChatModel) View() string {
 	if m.isPulling {
 		status = m.spinner.View() + dimStyle.Render(fmt.Sprintf(" Downloading %s · %s", m.pullModelName, m.pullStatus))
 	} else if m.waiting {
-		pendingSuffix := ""
-		if m.pendingInput != "" {
-			pendingSuffix = lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Bold(true).Render(" · [input pending]")
-		}
-		if m.agentSteps > 0 {
-			status = m.spinner.View() + dimStyle.Render(fmt.Sprintf(" Step %d — analyzing output…", m.agentSteps)) + pendingSuffix
-		} else {
-			status = m.spinner.View() + dimStyle.Render(" Billy is thinking…") + pendingSuffix
-		}
+		status = m.spinner.View() + dimStyle.Render(" Billy is thinking...")
 	} else {
 		badge := licenseBadge(m.lic)
 		modeBadge := lipgloss.NewStyle().Foreground(lipgloss.Color("#38bdf8")).Bold(true).Render("[AGENT]")
@@ -1029,16 +1001,7 @@ func (m ChatModel) renderShellPicker() string {
 	cmdHighlight := lipgloss.NewStyle().Foreground(lipgloss.Color("#38bdf8")).Bold(true)
 	selectedStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#f59e0b")).Bold(true)
 	dimRow := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
-	prefix := ""
-	if fields := strings.Fields(m.shellPending); len(fields) > 0 {
-		prefix = fields[0]
-	}
-	options := [4]string{
-		"Run once",
-		fmt.Sprintf("Allow '%s' this session", prefix),
-		"✅ Allow ALL commands this session",
-		"🚫 Cancel",
-	}
+	options := [3]string{"Run once", "Always this session", "Cancel"}
 	var rows []string
 	rows = append(rows, cmdHighlight.Render("⚡ "+m.shellPending))
 	rows = append(rows, "")
@@ -1168,64 +1131,6 @@ func (m ChatModel) loadConversation(id string) (ChatModel, tea.Cmd) {
 	return m, nil
 }
 
-// dispatchUserInput processes a user-typed message: applies freemium limits,
-// memory detection, persists to store, appends to history, and fires sendChat.
-// Called from KeyEnter directly, or deferred from pendingInput after Billy responds.
-func (m ChatModel) dispatchUserInput(input string) (ChatModel, tea.Cmd) {
-	if strings.HasPrefix(input, "/") {
-		return m.handleCommand(input)
-	}
-
-	// Freemium limits
-	if (m.lic == nil || m.lic.Free()) && m.msgCount >= 20 {
-		m.append(errorStyle.Render("⛔ Free tier limit reached (20 messages/session).\n\n") +
-			dimStyle.Render("Upgrade to Pro for unlimited conversations:\n  https://billy.sh/upgrade\n\nOr use /license <key> to activate an existing license.\n\n"))
-		return m, nil
-	}
-	if (m.lic == nil || m.lic.Free()) && m.msgCount == 15 {
-		m.append(dimStyle.Render("⚠️  Approaching free tier limit (15/20 messages). Upgrade to Pro for unlimited: https://billy.sh/upgrade\n\n"))
-	}
-	m.msgCount++
-
-	// Natural language memory detection
-	if fact, ok := memory.DetectAndExtract(input); ok {
-		if m.store != nil {
-			if err := m.store.SaveMemory(uuid.New().String(), fact); err == nil {
-				m.append(assistantStyle.Render("Billy >") + " " +
-					dimStyle.Render(fmt.Sprintf("Got it! I'll remember: \"%s\"\n\n", fact)))
-			} else {
-				m.append(errorStyle.Render("Couldn't save memory: "+err.Error()) + "\n\n")
-			}
-		} else {
-			m.append(dimStyle.Render("(Memory not available — no storage)\n\n"))
-		}
-		return m, nil
-	}
-
-	// Ensure a conversation exists in the store
-	if m.store != nil && m.conversationID == "" {
-		m.conversationID = uuid.New().String()
-		title := input
-		if len(title) > 60 {
-			title = title[:60] + "…"
-		}
-		_ = m.store.CreateConversation(m.conversationID, title, m.backend.CurrentModel())
-	}
-
-	m.history = append(m.history, backend.Message{Role: "user", Content: input})
-	m.tokenEstimate = estimateTokens(m.history)
-	m.append(userStyle.Render("You >") + " " + input + "\n\n")
-	m.agentSteps = 0
-	m.failedCmds = nil
-
-	if m.store != nil && m.conversationID != "" {
-		_ = m.store.AddMessage(uuid.New().String(), m.conversationID, "user", input)
-	}
-
-	m.waiting = true
-	return m, tea.Batch(m.sendChat(), m.spinner.Tick)
-}
-
 // sendChat fires off a chat request and returns the result as a chatMsg.
 // It prepends a system prompt built from memories before sending history.
 func (m ChatModel) sendChat() tea.Cmd {
@@ -1240,14 +1145,7 @@ func (m ChatModel) sendChat() tea.Cmd {
 	}
 	systemPrompt := memory.BuildSystemPrompt(memTexts)
 	if m.agentMode {
-		projectCtx := detectProject(m.workDir)
-		agentCtx := agentSystemPrompt
-		if projectCtx != "" {
-			agentCtx += fmt.Sprintf("\n\nCurrent project: %s\nWorking directory: %s", projectCtx, m.workDir)
-		} else {
-			agentCtx += fmt.Sprintf("\n\nWorking directory: %s", m.workDir)
-		}
-		systemPrompt = agentCtx + "\n\n" + systemPrompt
+		systemPrompt = agentSystemPrompt + "\n\n" + systemPrompt
 	}
 
 	// Prepend system message to history for this request
@@ -1260,34 +1158,10 @@ func (m ChatModel) sendChat() tea.Cmd {
 		NumPredict:  m.cfg.Ollama.NumPredict,
 	}
 	b := m.backend
-	return startStreamChat(b, fullHistory, opts)
-}
-
-// startStreamChat starts a streaming chat request and returns the first token
-// cmd. Each streamTokenMsg carries a next cmd to receive the following token.
-func startStreamChat(b backend.Backend, history []backend.Message, opts backend.ChatOptions) tea.Cmd {
-	type raw struct {
-		token string
-		done  bool
-		err   error
+	return func() tea.Msg {
+		content, err := b.Chat(context.Background(), fullHistory, opts)
+		return chatMsg{content: content, err: err}
 	}
-	ch := make(chan raw, 128)
-	go func() {
-		_, err := b.StreamChat(context.Background(), history, opts, func(token string) {
-			ch <- raw{token: token}
-		})
-		if err != nil {
-			ch <- raw{err: err, done: true}
-		} else {
-			ch <- raw{done: true}
-		}
-	}()
-	var listen func() tea.Msg
-	listen = func() tea.Msg {
-		r := <-ch
-		return streamTokenMsg{token: r.token, done: r.done, err: r.err, next: listen}
-	}
-	return listen
 }
 
 // handleCommand routes slash commands.
@@ -1300,25 +1174,46 @@ func (m ChatModel) handleCommand(input string) (ChatModel, tea.Cmd) {
 		// Enter activation mode — intercept next Enter in Update()
 		m.activating = true
 		m.textarea.Reset()
-		m.textarea.Placeholder = "Paste your BILLY-xxx license key and press Enter (Esc to cancel)..."
-		m.append(dimStyle.Render("🔑 Enter your license key below and press Enter:\n\n"))
+		m.textarea.Placeholder = "Paste your LemonSqueezy license key and press Enter (Esc to cancel)..."
+		m.append(dimStyle.Render("🔑 Enter your license key and press Enter:\n\n"))
+		return m, nil
+
+	case "/deactivate":
+		if m.lic == nil || m.lic.Free() {
+			m.append(dimStyle.Render("No active license on this machine.\n\n"))
+			m.textarea.Reset()
+			return m, nil
+		}
+		if m.store != nil {
+			if actBytes, err := m.store.GetEncrypted("ls_activation"); err == nil && len(actBytes) > 0 {
+				if act, err := license.UnmarshalActivation(actBytes); err == nil {
+					if err := license.Deactivate(act.Key, act.InstanceID); err != nil {
+						m.append(errorStyle.Render("❌ Deactivation failed: " + err.Error() + "\n\n"))
+					} else {
+						_ = m.store.SetEncrypted("ls_activation", []byte{})
+						m.lic = nil
+						m.append(dimStyle.Render("✅ License deactivated. This machine's seat has been freed.\nYou can activate on another machine or re-activate here anytime.\n\n"))
+					}
+				}
+			}
+		}
+		m.textarea.Reset()
 		return m, nil
 
 	case "/license":
-		// Show tier status only (activation is via /activate)
 		if m.lic == nil || m.lic.Free() {
 			m.append(dimStyle.Render("🔓 License: FREE tier\n\nLimits:\n• 20 messages per session\n• Memory not persisted between sessions\n• History limited to 5 conversations\n\nUpgrade at https://billy.sh\nUse /activate to enter a license key.\n\n"))
 		} else {
-			expStr := "Lifetime"
-			if !m.lic.Expiry.IsZero() {
-				expStr = m.lic.Expiry.Format("Jan 2, 2006")
-			}
 			seatsStr := ""
 			if m.lic.Seats > 0 {
 				seatsStr = fmt.Sprintf("\nSeats: %d", m.lic.Seats)
 			}
-			m.append(dimStyle.Render(fmt.Sprintf("✅ License: %s tier\nEmail: %s\nExpiry: %s%s\n\nAll features unlocked. 🐐\n\n",
-				strings.ToUpper(string(m.lic.EffectiveTier())), m.lic.Email, expStr, seatsStr)))
+			emailStr := ""
+			if m.lic.Email != "" {
+				emailStr = fmt.Sprintf("\nEmail: %s", m.lic.Email)
+			}
+			m.append(dimStyle.Render(fmt.Sprintf("✅ License: %s tier%s%s\nAll features unlocked. 🐐\nUse /deactivate to free this seat.\n\n",
+				strings.ToUpper(string(m.lic.EffectiveTier())), emailStr, seatsStr)))
 		}
 		m.textarea.Reset()
 		return m, nil
@@ -1331,7 +1226,7 @@ func (m ChatModel) handleCommand(input string) (ChatModel, tea.Cmd) {
 			return m, nil
 		}
 		shellCmd := strings.Join(parts[1:], " ")
-		return m.promptShellRun(shellCmd)
+		return m.promptShellRun(shellCmd), nil
 
 	case "/mode":
 		if len(parts) < 2 {
@@ -1409,7 +1304,7 @@ Keyboard:
   Ctrl+D / Ctrl+C    Quit
 
 Popular models to pull:
-  qwen2.5-coder:14b · qwen2.5-coder:7b · llama3 · codellama · phi3 · gemma · mistral
+  qwen2.5-coder:7b · llama3 · codellama · phi3 · gemma · mistral
   Full list: https://ollama.com/library
 
 `, modeStr)))
@@ -1900,159 +1795,90 @@ func (m ChatModel) explainCmd(shellCmd string) tea.Cmd {
 }
 
 // activateLicense validates the given key, encrypts it, and saves it to SQLite.
-func (m ChatModel) activateLicense(key string) ChatModel {
-	if key == "" {
-		m.append(errorStyle.Render("❌ No key entered. Use /activate to try again.\n\n"))
-		return m
-	}
-	parsed, err := license.Parse(key)
-	if err != nil {
-		m.append(errorStyle.Render("❌ Invalid license key: "+err.Error()+"\n\n"))
-		return m
-	}
-	if !parsed.IsActive() {
-		m.append(errorStyle.Render("❌ License key has expired.\n\n"))
-		return m
-	}
-
-	// Persist encrypted in SQLite (preferred) and plain in config (fallback)
-	if m.store != nil {
-		if err := m.store.SetEncrypted("license_key", []byte(key)); err != nil {
-			m.append(errorStyle.Render("⚠️  Could not save license to database: "+err.Error()+"\n\n"))
-		}
-	}
-	cfg := config.MustLoad()
-	cfg.LicenseKey = key
-	_ = config.Save(cfg)
-
-	m.lic = parsed
-	seatsNote := ""
-	if parsed.Seats > 0 {
-		seatsNote = fmt.Sprintf(" (%d seats)", parsed.Seats)
-	}
-	m.append(dimStyle.Render(fmt.Sprintf(
-		"✅ License activated! Welcome to %s tier%s, %s 🎉\n\nYour key is encrypted and stored securely.\n\n",
-		strings.ToUpper(string(parsed.EffectiveTier())), seatsNote, parsed.Email,
-	)))
-	return m
-}
-
 // promptShellRun shows a permission prompt before running a shell command.
-// If the command prefix has session-level "always" permission it starts immediately.
-func (m ChatModel) promptShellRun(shellCmd string) (ChatModel, tea.Cmd) {
+func (m ChatModel) promptShellRun(shellCmd string) ChatModel {
+	// Check session-level "always" permission
 	prefix := strings.Fields(shellCmd)[0]
 	if m.shellAlways[prefix] || m.shellAlways["*"] {
-		return m.startShellExec(shellCmd)
+		m = m.executeShell(shellCmd)
+		if len(m.cmdQueue) > 0 {
+			return m.promptNextQueuedCmd()
+		}
+		return m
 	}
+
 	m.shellPending = shellCmd
 	m.shellPickerIdx = 0
 	m.textarea.Reset()
 	m.textarea.Placeholder = "↑↓ select · Enter confirm · Esc cancel"
-	return m, nil
+	return m
 }
 
-// startShellExec kicks off an async shell command and shows a spinner.
-// The result arrives as a shellResultMsg.
-// If the exact command already failed in this agent chain, it is skipped and
-// the AI is told to try a different approach instead.
-func (m ChatModel) startShellExec(shellCmd string) (ChatModel, tea.Cmd) {
+// executeShell runs a shell command and appends its output to the viewport.
+func (m ChatModel) executeShell(shellCmd string) ChatModel {
 	m.shellPending = ""
 	m.textarea.Placeholder = "Ask Billy anything... (Enter to send, Ctrl+D to quit)"
 	m.textarea.Reset()
 
-	// Dedup: if this exact command already failed, skip and tell Billy.
-	warnStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Bold(true)
-	for _, attempt := range m.failedCmds {
-		if attempt.cmd == shellCmd {
-			m.append(warnStyle.Render("⚠ skipped — command already failed this session") + "\n\n")
-			feedback := fmt.Sprintf(
-				"Command > SKIPPED (duplicate failure): $ %s\n\nThis exact command already failed earlier in this session. You MUST try a completely different approach. Do not retry the same command.",
-				shellCmd,
-			)
-			m.pendingCmdOutputs = append(m.pendingCmdOutputs, feedback)
-			if len(m.cmdQueue) > 0 {
-				return m.promptNextQueuedCmd()
-			}
-			return m.flushCmdOutputs()
-		}
-	}
-
 	cmdStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Bold(true)
-	runningStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("12")) // blue
-	m.append(cmdStyle.Render("⚡ Run") + " " + dimStyle.Render(shellCmd) + "\n" + runningStyle.Render("   ⟳ running…") + "\n\n")
-	m.waiting = true
-	return m, tea.Batch(runShellCmd(shellCmd, m.workDir), m.spinner.Tick)
-}
+	m.append(cmdStyle.Render("Command >") + " " + dimStyle.Render(shellCmd+"\n\n"))
 
-// runShellCmd executes a shell command in a goroutine and returns the result as a shellResultMsg.
-// It appends a pwd marker so cd operations inside the command are tracked and workDir stays correct.
-func runShellCmd(shellCmd, workDir string) tea.Cmd {
-	const pwdMarker = "\n__BILLY_PWD__:"
-	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-		defer cancel()
-		// Append pwd capture so cd changes inside shellCmd are reflected back.
-		wrapped := shellCmd + "\nprintf '" + pwdMarker + "%s' \"$(pwd)\""
-		cmd := exec.CommandContext(ctx, "sh", "-c", wrapped) //nolint:gosec
-		cmd.Dir = workDir
-		var out bytes.Buffer
-		cmd.Stdout = &out
-		cmd.Stderr = &out
-		err := cmd.Run()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 
-		// Parse out the __BILLY_PWD__ marker and final working directory.
-		rawOutput := out.String()
-		newWorkDir := workDir
-		cleanOutput := rawOutput
-		if idx := strings.LastIndex(rawOutput, "\n__BILLY_PWD__:"); idx != -1 {
-			newWorkDir = strings.TrimSpace(rawOutput[idx+len("\n__BILLY_PWD__:"):])
-			cleanOutput = strings.TrimRight(rawOutput[:idx], "\n")
-		}
+	cmd := exec.CommandContext(ctx, "sh", "-c", shellCmd) //nolint:gosec
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
 
-		output := cleanOutput
-		if strings.TrimSpace(output) == "" {
-			output = "(no output)"
-		}
-		isErr := err != nil
-		var record string
-		if isErr {
-			record = fmt.Sprintf("$ %s\n[exit %s]\n%s", shellCmd, err.Error(), output)
-		} else {
-			record = fmt.Sprintf("$ %s\n%s", shellCmd, output)
-		}
-		return shellResultMsg{cmd: shellCmd, output: record, isErr: isErr, newWorkDir: newWorkDir}
+	err := cmd.Run()
+	output := out.String()
+	if output == "" {
+		output = "(no output)"
 	}
+	var record string
+	if err != nil {
+		record = fmt.Sprintf("$ %s\n[exit error: %s]\n%s", shellCmd, err.Error(), output)
+		m.appendCmdOutput(record, true)
+	} else {
+		record = fmt.Sprintf("$ %s\n%s", shellCmd, output)
+		m.appendCmdOutput(record, false)
+	}
+	if m.agentMode {
+		m.pendingCmdOutputs = append(m.pendingCmdOutputs, record)
+	}
+	return m
 }
+
 
 
 // agentSystemPrompt is prepended when in AGENT mode.
-const agentSystemPrompt = `You are Billy, a local AI coding assistant.
+const agentSystemPrompt = `You are Billy, an agentic AI coding assistant running locally via Ollama.
 
-MECHANISM: When you write a ` + "```bash" + ` block, the Billy app executes it on this machine and sends you the output as the next message. Write ONE bash block, then stop and wait for the result. After you receive output, write the next bash block. Repeat until the task is done.
+AGENT MODE is active. Your job is to take action, not just advise.
 
-EXAMPLE of a correct interaction:
-  User: "make a hello world Go app in /tmp/demo"
-  You:
-` + "```bash" + `
-mkdir -p /tmp/demo && cat > /tmp/demo/main.go << 'EOF'
-package main
-import "fmt"
-func main() { fmt.Println("Hello, world!") }
-EOF
-cd /tmp/demo && go run .
-` + "```" + `
-  [Billy sends you: Hello, world!]
-  You: DONE: Hello world Go app running at /tmp/demo
+Rules:
+- When the user asks you to run, create, install, build, or do ANYTHING that requires shell commands, provide the EXACT commands in ` + "```bash" + ` code blocks — never just describe them.
+- When creating files, include the full file content in a code block. Put the filename as a comment on the first line (e.g. // main.go).
+- Break complex tasks into sequential steps. Each step gets its own ` + "```bash" + ` block.
+- After each command runs, the output is automatically fed back to you. Analyze it: if there are errors, diagnose and provide a corrected command. Keep iterating until the task succeeds.
+- Be direct and action-oriented. Minimize prose, maximize commands.
+- If something could be destructive (rm -rf, DROP TABLE, etc), warn clearly before the block.
 
-RULES:
-- Your first response to any task must be a bash block. No intro, no plan, no numbered steps — just the bash block.
-- Write one bash block per response, then wait for the output before continuing.
-- Use ` + "`cat > file << 'EOF'`" + ` to create or overwrite files.
-- On error: diagnose it and write a corrected bash block. Keep iterating.
-- DONE: is only valid after you have received and read actual command output showing it works.
-- Do not repeat commands listed in the FAILED COMMANDS log — try a different approach.
-- Never ask the user to run anything manually.
-- Warn before destructive operations (rm -rf, DROP TABLE, etc).`
+Example good response:
+  Here's how to initialize a Go module:
+  ` + "```bash" + `
+  mkdir myapp && cd myapp
+  go mod init github.com/you/myapp
+  ` + "```" + `
+  Then create your main file:
+  ` + "```bash" + `
+  cat > main.go << 'EOF'
+  package main
+  import "fmt"
+  func main() { fmt.Println("hello") }
+  EOF
+  ` + "```" + ``
 
 // extractShellCommands finds all ```bash / ```sh / ```shell blocks in an AI
 // response and returns each block's trimmed content as a command string.
@@ -2090,13 +1916,13 @@ return cmds
 
 // promptNextQueuedCmd pops the first command from cmdQueue and shows its
 // permission prompt. Call this after a command completes or is skipped.
-func (m ChatModel) promptNextQueuedCmd() (ChatModel, tea.Cmd) {
-	if len(m.cmdQueue) == 0 {
-		return m, nil
-	}
-	cmd := m.cmdQueue[0]
-	m.cmdQueue = m.cmdQueue[1:]
-	return m.promptShellRun(cmd)
+func (m ChatModel) promptNextQueuedCmd() ChatModel {
+if len(m.cmdQueue) == 0 {
+return m
+}
+cmd := m.cmdQueue[0]
+m.cmdQueue = m.cmdQueue[1:]
+return m.promptShellRun(cmd)
 }
 
 // flushCmdOutputs feeds all accumulated shell outputs back to the AI as a user
@@ -2105,55 +1931,15 @@ func (m ChatModel) flushCmdOutputs() (ChatModel, tea.Cmd) {
 	if len(m.pendingCmdOutputs) == 0 {
 		return m, nil
 	}
-	m.agentSteps++
-	if m.agentSteps > 20 {
-		m.append(errorStyle.Render("⚠  Agent reached 20 steps. Type a follow-up to continue.\n\n"))
-		m.pendingCmdOutputs = nil
-		return m, nil
-	}
-
-	// Check whether this batch had any failures before we nil the slice.
-	batchHasErrors := false
-	for _, out := range m.pendingCmdOutputs {
-		if strings.Contains(out, "[exit ") {
-			batchHasErrors = true
-			break
-		}
-	}
-
 	combined := strings.Join(m.pendingCmdOutputs, "\n\n")
 	m.pendingCmdOutputs = nil
-
-	// Prepend a structured attempt log so the AI can see every command that has
-	// already failed — preventing it from suggesting the same fix in a loop.
-	if len(m.failedCmds) > 0 {
-		var sb strings.Builder
-		sb.WriteString("=== FAILED COMMANDS THIS SESSION (do NOT retry any of these) ===\n")
-		for i, a := range m.failedCmds {
-			preview := a.cmd
-			if len(preview) > 120 {
-				preview = preview[:120] + "…"
-			}
-			sb.WriteString(fmt.Sprintf("[%d] $ %s\n%s\n\n", i+1, preview, a.errSnip))
-		}
-		sb.WriteString("=== You MUST try a different approach for any repeated failures above. ===\n\n")
-		combined = sb.String() + combined
-	}
-
-	// When every command in this batch succeeded, nudge the AI to stop if the
-	// task is truly done. This prevents the "re-verify forever" hang while still
-	// letting Billy chain follow-up steps when there is genuine work remaining.
-	if !batchHasErrors {
-		combined += "\n\n(All commands above succeeded. If the task is fully complete and you have seen it working, write DONE: <one-line summary> and stop. Only propose more commands if there is genuine remaining work.)"
-	}
-
 	m.history = append(m.history, backend.Message{Role: "user", Content: combined})
 	m.tokenEstimate = estimateTokens(m.history)
 	if m.store != nil && m.conversationID != "" {
 		_ = m.store.AddMessage(uuid.New().String(), m.conversationID, "user", combined)
 	}
-	cmdLabelStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("13")).Bold(true) // purple
-	m.append(cmdLabelStyle.Render(fmt.Sprintf("⟳ Step %d — Billy is analyzing output…", m.agentSteps)) + "\n\n")
+	cmdLabelStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Bold(true)
+	m.append(cmdLabelStyle.Render("Command >") + " " + dimStyle.Render("output sent to Billy...\n\n"))
 	m.waiting = true
 	return m, tea.Batch(m.sendChat(), m.spinner.Tick)
 }
