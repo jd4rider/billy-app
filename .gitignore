@@ -22,6 +22,12 @@ coverage.out
 
 # macOS
 .DS_Store
+# macOS Finder duplicate copies (trailing " 2")
+* 2
+* 2/
+.env 2*
+.gitignore 2*
+.goreleaser 2*
 
 # IDE
 .idea/
