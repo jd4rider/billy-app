@@ -265,44 +265,44 @@ type collapsedOutput struct {
 
 // ChatModel is the Bubble Tea model for the main chat interface.
 type ChatModel struct {
-	cfg            *config.Config
-	backend        backend.Backend
-	store          *store.Store
-	lic            *license.License // nil = free tier
-	msgCount       int              // messages sent this session (for free limit)
-	conversationID string
-	history        []backend.Message
-	content        string // raw accumulated content for the viewport
-	viewport       viewport.Model
-	textarea       textarea.Model
-	spinner        spinner.Model
-	historyMode    bool
-	historyList    list.Model
-	width          int
-	height         int
-	waiting        bool
-	showPicker     bool
-	pickerItems    []pickerItem
-	pickerIdx      int
-	activating               bool            // true while /activate key-entry prompt is shown
-	pendingActivationKey     string          // key being activated (for licenseActivatedMsg handler)
-	pendingValidation        bool            // trigger background re-validation on Init
-	pendingValidationKey     string
-	pendingValidationInstID  string
-	shellPending   string          // shell command awaiting user permission
-	shellAlways    map[string]bool // session-level "always run" prefixes
-	shellPickerIdx    int              // 0=Run once, 1=Always, 2=Cancel
-	progressBar       progress.Model    // animated bar for /pull downloads
-	isPulling         bool               // true while model pull in progress
-	pullStatus        string             // current pull status string from Ollama
-	pullModelName     string             // model name being pulled
-	pendingCmdOutputs []string         // shell outputs buffered for AI feedback
-	collapsedOutputs  []collapsedOutput // folded long command outputs
-	cmdQueue       []string        // AI-suggested commands pending permission
-	agentMode      bool            // true = agentic (default), false = chat only
-	tokenEstimate  int             // rough token count for current history
-	compacted      bool            // true if history has been compacted
-	workDir        string          // current working directory for the session
+	cfg                     *config.Config
+	backend                 backend.Backend
+	store                   *store.Store
+	lic                     *license.License // nil = free tier
+	msgCount                int              // messages sent this session (for free limit)
+	conversationID          string
+	history                 []backend.Message
+	content                 string // raw accumulated content for the viewport
+	viewport                viewport.Model
+	textarea                textarea.Model
+	spinner                 spinner.Model
+	historyMode             bool
+	historyList             list.Model
+	width                   int
+	height                  int
+	waiting                 bool
+	showPicker              bool
+	pickerItems             []pickerItem
+	pickerIdx               int
+	activating              bool   // true while /activate key-entry prompt is shown
+	pendingActivationKey    string // key being activated (for licenseActivatedMsg handler)
+	pendingValidation       bool   // trigger background re-validation on Init
+	pendingValidationKey    string
+	pendingValidationInstID string
+	shellPending            string            // shell command awaiting user permission
+	shellAlways             map[string]bool   // session-level "always run" prefixes
+	shellPickerIdx          int               // 0=Run once, 1=Always, 2=Cancel
+	progressBar             progress.Model    // animated bar for /pull downloads
+	isPulling               bool              // true while model pull in progress
+	pullStatus              string            // current pull status string from Ollama
+	pullModelName           string            // model name being pulled
+	pendingCmdOutputs       []string          // shell outputs buffered for AI feedback
+	collapsedOutputs        []collapsedOutput // folded long command outputs
+	cmdQueue                []string          // AI-suggested commands pending permission
+	agentMode               bool              // true = agentic (default), false = chat only
+	tokenEstimate           int               // rough token count for current history
+	compacted               bool              // true if history has been compacted
+	workDir                 string            // current working directory for the session
 }
 
 // New creates a new ChatModel.
@@ -335,9 +335,9 @@ func New(cfg *config.Config, b backend.Backend, s *store.Store) ChatModel {
 		viewport:    vp,
 		textarea:    ta,
 		spinner:     sp,
-		shellAlways:  make(map[string]bool),
-		agentMode:    true, // agentic by default
-		progressBar:  progress.New(
+		shellAlways: make(map[string]bool),
+		agentMode:   true, // agentic by default
+		progressBar: progress.New(
 			progress.WithGradient("#38bdf8", "#a855f7"),
 			progress.WithWidth(60),
 		),
@@ -373,9 +373,9 @@ func (m ChatModel) Init() tea.Cmd {
 
 func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var (
-		taCmd  tea.Cmd
-		vpCmd  tea.Cmd
-		spCmd  tea.Cmd
+		taCmd tea.Cmd
+		vpCmd tea.Cmd
+		spCmd tea.Cmd
 	)
 
 	switch msg := msg.(type) {
@@ -411,127 +411,127 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, listCmd
 		}
 
-	// ── /activate key-entry mode ─────────────────────────────────────────
-	if m.activating {
-		switch msg.Type {
-		case tea.KeyEsc, tea.KeyCtrlC:
-			m.activating = false
-			m.textarea.Placeholder = "Ask Billy anything... (Enter to send, Ctrl+D to quit)"
-			m.textarea.Reset()
-			m.append(dimStyle.Render("Activation cancelled.\n\n"))
-			return m, nil
-		case tea.KeyEnter:
-			key := strings.TrimSpace(m.textarea.Value())
-			m.activating = false
-			m.textarea.Placeholder = "Ask Billy anything... (Enter to send, Ctrl+D to quit)"
-			m.textarea.Reset()
-			if key == "" {
-				m.append(errorStyle.Render("❌ No key entered. Use /activate to try again.\n\n"))
+		// ── /activate key-entry mode ─────────────────────────────────────────
+		if m.activating {
+			switch msg.Type {
+			case tea.KeyEsc, tea.KeyCtrlC:
+				m.activating = false
+				m.textarea.Placeholder = "Ask Billy anything... (Enter to send, Ctrl+D to quit)"
+				m.textarea.Reset()
+				m.append(dimStyle.Render("Activation cancelled.\n\n"))
 				return m, nil
-			}
-			// Read any existing activation so we can deactivate it first (frees old seat)
-			var oldKey, oldInstID string
-			if m.store != nil {
-				if actBytes, err := m.store.GetEncrypted("ls_activation"); err == nil && len(actBytes) > 0 {
-					if act, err := license.UnmarshalActivation(actBytes); err == nil {
-						oldKey, oldInstID = act.Key, act.InstanceID
+			case tea.KeyEnter:
+				key := strings.TrimSpace(m.textarea.Value())
+				m.activating = false
+				m.textarea.Placeholder = "Ask Billy anything... (Enter to send, Ctrl+D to quit)"
+				m.textarea.Reset()
+				if key == "" {
+					m.append(errorStyle.Render("❌ No key entered. Use /activate to try again.\n\n"))
+					return m, nil
+				}
+				// Read any existing activation so we can deactivate it first (frees old seat)
+				var oldKey, oldInstID string
+				if m.store != nil {
+					if actBytes, err := m.store.GetEncrypted("ls_activation"); err == nil && len(actBytes) > 0 {
+						if act, err := license.UnmarshalActivation(actBytes); err == nil {
+							oldKey, oldInstID = act.Key, act.InstanceID
+						}
 					}
 				}
+				m.pendingActivationKey = key
+				m.append(dimStyle.Render("🔄 Contacting activation server...\n\n"))
+				return m, activateLicenseCmd(key, oldKey, oldInstID)
 			}
-			m.pendingActivationKey = key
-			m.append(dimStyle.Render("🔄 Contacting activation server...\n\n"))
-			return m, activateLicenseCmd(key, oldKey, oldInstID)
+			m.textarea, taCmd = m.textarea.Update(msg)
+			return m, taCmd
 		}
-		m.textarea, taCmd = m.textarea.Update(msg)
-		return m, taCmd
-	}
 
-	// ── Shell permission picker ────────────────────────────────────────────
-	if m.shellPending != "" {
-		switch msg.Type {
-		case tea.KeyUp:
-			if m.shellPickerIdx > 0 {
-				m.shellPickerIdx--
-			}
-			return m, nil
-		case tea.KeyDown:
-			if m.shellPickerIdx < 2 {
-				m.shellPickerIdx++
-			}
-			return m, nil
-		case tea.KeyEnter:
-			pending := m.shellPending
-			m.shellPending = ""
-			switch m.shellPickerIdx {
-			case 0: // Run once
-				m = m.executeShell(pending)
-			case 1: // Always this session
-				prefix := strings.Fields(pending)[0]
-				m.shellAlways[prefix] = true
-				m = m.executeShell(pending)
-			case 2: // Cancel
-				m.append(dimStyle.Render("Skipped.\n\n"))
+		// ── Shell permission picker ────────────────────────────────────────────
+		if m.shellPending != "" {
+			switch msg.Type {
+			case tea.KeyUp:
+				if m.shellPickerIdx > 0 {
+					m.shellPickerIdx--
+				}
+				return m, nil
+			case tea.KeyDown:
+				if m.shellPickerIdx < 2 {
+					m.shellPickerIdx++
+				}
+				return m, nil
+			case tea.KeyEnter:
+				pending := m.shellPending
+				m.shellPending = ""
+				switch m.shellPickerIdx {
+				case 0: // Run once
+					m = m.executeShell(pending)
+				case 1: // Always this session
+					prefix := strings.Fields(pending)[0]
+					m.shellAlways[prefix] = true
+					m = m.executeShell(pending)
+				case 2: // Cancel
+					m.append(dimStyle.Render("Skipped.\n\n"))
+					m.cmdQueue = nil
+					m.pendingCmdOutputs = nil
+				}
+				m.shellPickerIdx = 0
+				if len(m.cmdQueue) > 0 {
+					m = m.promptNextQueuedCmd()
+					return m, nil
+				}
+				if len(m.pendingCmdOutputs) > 0 {
+					m, cmd := m.flushCmdOutputs()
+					return m, cmd
+				}
+				m.textarea.Placeholder = "Ask Billy anything... (Enter to send, Ctrl+D to quit)"
+				m.textarea.Reset()
+				return m, nil
+			case tea.KeyEsc:
+				m.shellPending = ""
+				m.shellPickerIdx = 0
 				m.cmdQueue = nil
 				m.pendingCmdOutputs = nil
-			}
-			m.shellPickerIdx = 0
-			if len(m.cmdQueue) > 0 {
-				m = m.promptNextQueuedCmd()
+				m.textarea.Placeholder = "Ask Billy anything... (Enter to send, Ctrl+D to quit)"
+				m.textarea.Reset()
+				m.append(dimStyle.Render("Skipped.\n\n"))
 				return m, nil
 			}
-			if len(m.pendingCmdOutputs) > 0 {
-				m, cmd := m.flushCmdOutputs()
-				return m, cmd
-			}
-			m.textarea.Placeholder = "Ask Billy anything... (Enter to send, Ctrl+D to quit)"
-			m.textarea.Reset()
-			return m, nil
-		case tea.KeyEsc:
-			m.shellPending = ""
-			m.shellPickerIdx = 0
-			m.cmdQueue = nil
-			m.pendingCmdOutputs = nil
-			m.textarea.Placeholder = "Ask Billy anything... (Enter to send, Ctrl+D to quit)"
-			m.textarea.Reset()
-			m.append(dimStyle.Render("Skipped.\n\n"))
+			// Block all other keypresses while permission picker is active
 			return m, nil
 		}
-		// Block all other keypresses while permission picker is active
-		return m, nil
-	}
-	// Command picker navigation — intercepts keys when picker is visible
-	if m.showPicker && len(m.pickerItems) > 0 {
+		// Command picker navigation — intercepts keys when picker is visible
+		if m.showPicker && len(m.pickerItems) > 0 {
+			switch msg.Type {
+			case tea.KeyUp:
+				if m.pickerIdx > 0 {
+					m.pickerIdx--
+				}
+				return m, nil
+			case tea.KeyDown:
+				if m.pickerIdx < len(m.pickerItems)-1 {
+					m.pickerIdx++
+				}
+				return m, nil
+			case tea.KeyEnter:
+				selected := m.pickerItems[m.pickerIdx]
+				if selected.hasArgs {
+					m.textarea.SetValue(selected.cmd + " ")
+				} else {
+					m.textarea.SetValue(selected.cmd)
+				}
+				m.showPicker = false
+				m.pickerIdx = 0
+				if !selected.hasArgs {
+					return m, func() tea.Msg { return tea.KeyMsg{Type: tea.KeyEnter} }
+				}
+				return m, nil
+			case tea.KeyEsc:
+				m.showPicker = false
+				m.pickerIdx = 0
+				return m, nil
+			}
+		}
 		switch msg.Type {
-		case tea.KeyUp:
-			if m.pickerIdx > 0 {
-				m.pickerIdx--
-			}
-			return m, nil
-		case tea.KeyDown:
-			if m.pickerIdx < len(m.pickerItems)-1 {
-				m.pickerIdx++
-			}
-			return m, nil
-		case tea.KeyEnter:
-			selected := m.pickerItems[m.pickerIdx]
-			if selected.hasArgs {
-				m.textarea.SetValue(selected.cmd + " ")
-			} else {
-				m.textarea.SetValue(selected.cmd)
-			}
-			m.showPicker = false
-			m.pickerIdx = 0
-			if !selected.hasArgs {
-				return m, func() tea.Msg { return tea.KeyMsg{Type: tea.KeyEnter} }
-			}
-			return m, nil
-		case tea.KeyEsc:
-			m.showPicker = false
-			m.pickerIdx = 0
-			return m, nil
-		}
-	}
-	switch msg.Type {
 		case tea.KeyCtrlX:
 			// Expand the most recently collapsed command output
 			for i := len(m.collapsedOutputs) - 1; i >= 0; i-- {
@@ -562,7 +562,7 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Freemium limits
 			if (m.lic == nil || m.lic.Free()) && m.msgCount >= 20 {
 				m.append(errorStyle.Render("⛔ Free tier limit reached (20 messages/session).\n\n") +
-					dimStyle.Render("Upgrade to Pro for unlimited conversations:\n  https://billy.sh/upgrade\n\nOr use /license <key> to activate an existing license.\n\n"))
+					dimStyle.Render("Upgrade to Pro for unlimited conversations:\n  https://billy.sh/upgrade\n\nOr use /activate to enter an existing license.\n\n"))
 				m.textarea.Reset()
 				return m, nil
 			}
@@ -849,7 +849,7 @@ func (m ChatModel) View() string {
 	}
 
 	parts := []string{
-		borderStyle.Width(m.width-2).Render(m.viewport.View()),
+		borderStyle.Width(m.width - 2).Render(m.viewport.View()),
 		status,
 	}
 	if m.isPulling {
@@ -1304,7 +1304,7 @@ Keyboard:
   Ctrl+D / Ctrl+C    Quit
 
 Popular models to pull:
-  qwen2.5-coder:7b · llama3 · codellama · phi3 · gemma · mistral
+  qwen2.5-coder:14b · qwen2.5-coder:7b · llama3 · codellama · phi3 · gemma · mistral
   Full list: https://ollama.com/library
 
 `, modeStr)))
@@ -1850,8 +1850,6 @@ func (m ChatModel) executeShell(shellCmd string) ChatModel {
 	return m
 }
 
-
-
 // agentSystemPrompt is prepended when in AGENT mode.
 const agentSystemPrompt = `You are Billy, an agentic AI coding assistant running locally via Ollama.
 
@@ -1883,46 +1881,46 @@ Example good response:
 // extractShellCommands finds all ```bash / ```sh / ```shell blocks in an AI
 // response and returns each block's trimmed content as a command string.
 func extractShellCommands(content string) []string {
-var cmds []string
-lines := strings.Split(content, "\n")
-inBlock := false
-var block strings.Builder
+	var cmds []string
+	lines := strings.Split(content, "\n")
+	inBlock := false
+	var block strings.Builder
 
-for _, line := range lines {
-if !inBlock {
-stripped := strings.TrimSpace(line)
-if strings.HasPrefix(stripped, "```") {
-lang := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(stripped, "```")))
-if lang == "bash" || lang == "sh" || lang == "shell" || lang == "zsh" {
-inBlock = true
-block.Reset()
-}
-}
-continue
-}
-// Inside a block
-if strings.TrimSpace(line) == "```" {
-inBlock = false
-cmd := strings.TrimSpace(block.String())
-if cmd != "" {
-cmds = append(cmds, cmd)
-}
-continue
-}
-block.WriteString(line + "\n")
-}
-return cmds
+	for _, line := range lines {
+		if !inBlock {
+			stripped := strings.TrimSpace(line)
+			if strings.HasPrefix(stripped, "```") {
+				lang := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(stripped, "```")))
+				if lang == "bash" || lang == "sh" || lang == "shell" || lang == "zsh" {
+					inBlock = true
+					block.Reset()
+				}
+			}
+			continue
+		}
+		// Inside a block
+		if strings.TrimSpace(line) == "```" {
+			inBlock = false
+			cmd := strings.TrimSpace(block.String())
+			if cmd != "" {
+				cmds = append(cmds, cmd)
+			}
+			continue
+		}
+		block.WriteString(line + "\n")
+	}
+	return cmds
 }
 
 // promptNextQueuedCmd pops the first command from cmdQueue and shows its
 // permission prompt. Call this after a command completes or is skipped.
 func (m ChatModel) promptNextQueuedCmd() ChatModel {
-if len(m.cmdQueue) == 0 {
-return m
-}
-cmd := m.cmdQueue[0]
-m.cmdQueue = m.cmdQueue[1:]
-return m.promptShellRun(cmd)
+	if len(m.cmdQueue) == 0 {
+		return m
+	}
+	cmd := m.cmdQueue[0]
+	m.cmdQueue = m.cmdQueue[1:]
+	return m.promptShellRun(cmd)
 }
 
 // flushCmdOutputs feeds all accumulated shell outputs back to the AI as a user

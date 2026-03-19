@@ -128,7 +128,7 @@ func runExec(args []string, cfg *config.Config, b backend.Backend, s *store.Stor
 
 	if runErr != nil {
 		fmt.Printf("\n⚠ Exited with error: %v\n", runErr)
-		fmt.Println("\n🤔 Asking Billy what went wrong...\n")
+		fmt.Print("\n🤔 Asking Billy what went wrong...\n\n")
 		content, _ := os.ReadFile(file)
 		prompt := fmt.Sprintf("This program exited with an error. Here's the source code and the output. Diagnose the problem and suggest a fix.\n\nFile: %s\n```\n%s\n```\n\nOutput:\n```\n%s\n```\n\nError: %v", file, string(content), out.String(), runErr)
 		return chat(prompt, cfg, b, s)

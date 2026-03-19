@@ -33,7 +33,7 @@
 - 💾 **Session checkpoints** — `/session` saves named AI-generated checkpoints you can reload
 - 🎨 **Syntax highlighting** — code blocks rendered with full markdown support
 - 🔄 **Model management** — list, switch, and pull new models right from the chat
-- 🔑 **License tiers** — Free / Pro / Premium / Team / Enterprise; activate with `/activate`
+- 🔑 **License tiers** — Free / Pro / Premium / Team / Enterprise; activate with `/activate`, free a seat with `/deactivate`
 - 🖥 **One-shot mode** — run `billy "explain this"` directly from the terminal without launching the TUI
 - ⚙️ **Simple config** — single TOML file at `~/.localai/config.toml`
 - 💾 **SQLite backend** — all history, memories, and settings stored locally at `~/.localai/history.db`
@@ -207,7 +207,8 @@ When Billy suggests a shell command in a bash block, it will prompt:
 
 | Command | Description |
 |---|---|
-| `/activate` | Enter a license key to unlock Pro / Premium features |
+| `/activate` | Prompt for your Billy license key and activate this machine |
+| `/deactivate` | Release this machine's seat back to your license |
 | `/license` | Show current license tier and status |
 
 ### General
@@ -256,7 +257,7 @@ The current mode and working directory are shown in the status bar at the bottom
 | **Team** | ~$14/seat | Bulk seats, shared memory, admin controls |
 | **Enterprise** | Custom | Unlimited seats, self-hosted, SLA — call [406-396-7246](tel:+14063967246) |
 
-Upgrade at **[billy.sh](https://jd4rider.github.io/billy-web)** → activate with `/activate <key>`.
+Upgrade at **[billy.sh](https://jd4rider.github.io/billy-web)**, then run `/activate` inside Billy.
 
 ---
 
@@ -302,7 +303,7 @@ BILLY_MODEL=llama3 BILLY_BACKEND_URL=http://192.168.1.10:11434 billy
 | ✅ | Agentic mode — shell command detection & permission prompts |
 | ✅ | `/run` shell execution |
 | ✅ | License system — Free / Pro / Premium / Team / Enterprise |
-| ✅ | `/activate` with AES-256-GCM encrypted key storage |
+| ✅ | Lemon Squeezy activation with encrypted local activation storage |
 | ✅ | Binary distribution — slim + fat (bundled Ollama) |
 | ✅ | Homebrew tap, Scoop bucket, .deb/.rpm/.apk packages |
 | ✅ | [billy.sh](https://jd4rider.github.io/billy-web) landing page live |
@@ -328,13 +329,12 @@ BILLY_MODEL=llama3 BILLY_BACKEND_URL=http://192.168.1.10:11434 billy
 ```
 billy-app/
 ├── cmd/
-│   ├── billy/          # Main entry point (TUI + one-shot dispatch)
-│   └── keygen/         # Dev tool: sign license keys with Ed25519 private key
+│   └── billy/          # Main entry point (TUI + one-shot dispatch)
 ├── internal/
 │   ├── backend/        # AI backend clients (Ollama; Groq/custom coming)
 │   ├── config/         # TOML config + env var overrides
 │   ├── launcher/       # Ollama detection, start, embed (slim/fat)
-│   ├── license/        # Ed25519 license verification, tier constants
+│   ├── license/        # Lemon Squeezy activation/validation + tier constants
 │   ├── memory/         # Memory detection & system prompt builder
 │   ├── oneshot/        # Headless one-shot execution (no TUI)
 │   ├── store/          # SQLite: history, memories, kv (encrypted), checkpoints
