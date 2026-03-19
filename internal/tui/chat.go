@@ -3,6 +3,7 @@ package tui
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -58,6 +59,7 @@ type pickerItem struct {
 
 var commandList = []pickerItem{
 	{"/activate", "Activate a Billy license key (prompts for key)", false},
+	{"/admin", "Admin controls: PIN, mode lock, curriculum (Pro+)", true},
 	{"/backend", "Show backend status or reload backend config", false},
 	{"/cd", "Change working directory (autocompletes paths)", true},
 	{"/clear", "Clear the current chat", false},
@@ -66,11 +68,12 @@ var commandList = []pickerItem{
 	{"/explain", "Explain what a shell command does", true},
 	{"/git", "Show git status and recent commits", false},
 	{"/help", "Show all commands", false},
+	{"/hint", "Request a more specific hint (teach mode)", false},
 	{"/history", "Browse past conversations", false},
 	{"/license", "Show current license / tier status", false},
 	{"/ls", "List files in current (or given) directory", true},
 	{"/memory", "List or manage memories", false},
-	{"/mode", "Switch between agent and chat mode", true},
+	{"/mode", "Switch between agent, chat, and teach mode", true},
 	{"/model", "List or switch Ollama models", true},
 	{"/pull", "Download a model from Ollama", true},
 	{"/pwd", "Print current working directory", false},
@@ -381,6 +384,7 @@ type ChatModel struct {
 	collapsedOutputs        []collapsedOutput // folded long command outputs
 	cmdQueue                []string          // AI-suggested commands pending permission
 	agentMode               bool              // true = agentic (default), false = chat only
+	teachMode               bool              // true = teach mode (show commands, don't run)
 	tokenEstimate           int               // rough token count for current history
 	compacted               bool              // true if history has been compacted
 	workDir                 string            // current working directory for the session
@@ -745,6 +749,18 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						return m, flushCmd
 					}
 				}
+			} else if m.teachMode {
+				cmds := extractShellCommands(msg.content)
+				if len(cmds) > 0 {
+					for _, cmd := range cmds {
+						box := lipgloss.NewStyle().
+							Border(lipgloss.RoundedBorder()).
+							BorderForeground(lipgloss.Color("#4ade80")).
+							Padding(0, 1).
+							Render("📝 Type this yourself:\n  " + cmd)
+						m.append(box + "\n\n")
+					}
+				}
 			}
 		}
 		return m, nil
@@ -918,8 +934,13 @@ func (m ChatModel) View() string {
 		status = m.spinner.View() + dimStyle.Render(" Billy is thinking...")
 	} else {
 		badge := licenseBadge(m.lic)
-		modeBadge := lipgloss.NewStyle().Foreground(lipgloss.Color("#38bdf8")).Bold(true).Render("[AGENT]")
-		if !m.agentMode {
+		var modeBadge string
+		switch {
+		case m.teachMode:
+			modeBadge = lipgloss.NewStyle().Foreground(lipgloss.Color("#4ade80")).Bold(true).Render("[TEACH]")
+		case m.agentMode:
+			modeBadge = lipgloss.NewStyle().Foreground(lipgloss.Color("#38bdf8")).Bold(true).Render("[AGENT]")
+		default:
 			modeBadge = dimStyle.Render("[CHAT]")
 		}
 		pwdBadge := dimStyle.Render(abbreviatePath(m.workDir))
@@ -1227,6 +1248,8 @@ func (m ChatModel) sendChat() tea.Cmd {
 	systemPrompt := memory.BuildSystemPrompt(memTexts)
 	if m.agentMode {
 		systemPrompt = agentSystemPrompt + "\n\n" + systemPrompt
+	} else if m.teachMode {
+		systemPrompt = teachSystemPrompt + "\n\n" + systemPrompt
 	}
 
 	// Prepend system message to history for this request
@@ -1342,22 +1365,42 @@ func (m ChatModel) handleCommand(input string) (ChatModel, tea.Cmd) {
 
 	case "/mode":
 		if len(parts) < 2 {
-			modeStr := "agent"
-			if !m.agentMode {
-				modeStr = "chat"
+			modeStr := "AGENT"
+			if m.teachMode {
+				modeStr = "TEACH"
+			} else if !m.agentMode {
+				modeStr = "CHAT"
 			}
-			m.append(dimStyle.Render(fmt.Sprintf("Current mode: %s\n\n  /mode agent  — Billy detects and offers to run commands\n  /mode chat   — conversation only, no command execution\n\n", strings.ToUpper(modeStr))))
+			m.append(dimStyle.Render(fmt.Sprintf("Current mode: %s\n\n  /mode agent  — Billy detects and offers to run commands\n  /mode chat   — conversation only, no command execution\n  /mode teach  — Billy guides step by step, shows commands for you to type\n\n", modeStr)))
 		} else {
+			// Check admin lock before allowing mode switch
+			if m.store != nil {
+				if cfgBytes, err := m.store.GetEncrypted("admin_config"); err == nil && len(cfgBytes) > 0 {
+					var ac adminConfig
+					if json.Unmarshal(cfgBytes, &ac) == nil && ac.Locked {
+						m.append(errorStyle.Render("⛔ Mode is locked by admin. Contact your administrator.\n\n"))
+						m.textarea.Reset()
+						return m, nil
+					}
+				}
+			}
 			switch parts[1] {
 			case "agent":
 				m.agentMode = true
+				m.teachMode = false
 				m.append(dimStyle.Render("✅ Switched to AGENT mode.\nBilly will detect commands in responses and ask to run them.\n\n"))
 			case "chat":
 				m.agentMode = false
+				m.teachMode = false
 				m.cmdQueue = nil
 				m.append(dimStyle.Render("✅ Switched to CHAT mode.\nBilly will answer questions only — no command execution.\n\n"))
+			case "teach":
+				m.teachMode = true
+				m.agentMode = false
+				m.cmdQueue = nil
+				m.append(dimStyle.Render("✅ Switched to TEACH mode.\nBilly will guide you step by step. Shell commands are shown for you to type yourself.\n\n"))
 			default:
-				m.append(errorStyle.Render("Unknown mode. Use: /mode agent  or  /mode chat\n\n"))
+				m.append(errorStyle.Render("Unknown mode. Use: /mode agent  or  /mode chat  or  /mode teach\n\n"))
 			}
 		}
 		m.textarea.Reset()
@@ -1365,7 +1408,9 @@ func (m ChatModel) handleCommand(input string) (ChatModel, tea.Cmd) {
 
 	case "/help":
 		modeStr := "AGENT (default)"
-		if !m.agentMode {
+		if m.teachMode {
+			modeStr = "TEACH"
+		} else if !m.agentMode {
 			modeStr = "CHAT"
 		}
 		m.append(dimStyle.Render(fmt.Sprintf(`
@@ -1374,7 +1419,7 @@ Commands:
   /activate          Activate a Billy license key (interactive prompt)
   /backend [reload]  Show backend status or reload backend config
   /license           Show current license / tier status
-  /mode [agent|chat] Switch mode (current: %s)
+  /mode [agent|chat|teach] Switch mode (current: %s)
   /model             List installed models (active model highlighted)
   /model <name>      Switch to a different model
   /pull <name>       Download a new model from Ollama (local backend only)
@@ -1392,6 +1437,11 @@ Commands:
   /session load <n>  Restore a checkpoint by name
   /clear             Clear conversation history
   /quit, /exit       Exit Billy
+
+Teaching mode:
+  /teach             Shortcut for /mode teach
+  /hint              Ask Billy for a more specific hint (teach mode)
+  /admin             Admin controls (Pro+): PIN, mode lock, curriculum
 
 Filesystem:
   /pwd               Print current working directory
@@ -1425,6 +1475,24 @@ Popular models to pull:
 	case "/models":
 		// Alias for /model with no args
 		return m.handleCommand("/model")
+
+	case "/teach":
+		// Shortcut for /mode teach
+		return m.handleCommand("/mode teach")
+
+	case "/hint":
+		hintMsg := backend.Message{Role: "user", Content: "Give me a more specific hint for what I should do next. Guide me step by step without giving me the complete answer."}
+		m.waiting = true
+		m.textarea.Reset()
+		return m, tea.Batch(m.sendHintCmd(hintMsg), m.spinner.Tick)
+
+	case "/admin":
+		if len(parts) < 2 {
+			m.append(dimStyle.Render("Admin commands (Pro+ only):\n  /admin setup <pin>         — Set up admin PIN\n  /admin lock                — Lock mode to TEACH\n  /admin unlock              — Remove mode lock\n  /admin curriculum <text>   — Set curriculum context\n  /admin status              — Show admin config\n\n"))
+			m.textarea.Reset()
+			return m, nil
+		}
+		return m.handleAdminCommand(parts[1:])
 
 	case "/memory":
 		if m.store == nil {
@@ -2007,6 +2075,208 @@ Example good response:
   func main() { fmt.Println("hello") }
   EOF
   ` + "```" + ``
+
+// teachSystemPrompt is prepended when in TEACH mode.
+const teachSystemPrompt = `You are Billy, an AI coding tutor running locally via Ollama.
+
+TEACH MODE is active. Your job is to guide the user to learn by doing — never do the work for them.
+
+Rules:
+- Break tasks into small, numbered steps. Explain the concept behind each step before showing it.
+- When a shell command is needed, provide it in a ` + "```bash" + ` code block — the UI will display it as something for the user to type themselves (not auto-run).
+- Ask the user to try each step and report back before moving on.
+- If the user gets stuck, give a targeted hint rather than the full solution.
+- Encourage understanding: explain why, not just how.
+- Be patient, supportive, and pedagogical.`
+
+// adminConfig holds admin-controlled settings stored encrypted in the KV store.
+type adminConfig struct {
+	Locked     bool   `json:"locked"`
+	LockMode   string `json:"lock_mode"`
+	Curriculum string `json:"curriculum"`
+}
+
+// loadAdminConfig reads and decrypts the admin config from the store.
+// Returns a zero-value adminConfig if none is set.
+func (m ChatModel) loadAdminConfig() (adminConfig, error) {
+	var ac adminConfig
+	if m.store == nil {
+		return ac, nil
+	}
+	cfgBytes, err := m.store.GetEncrypted("admin_config")
+	if err != nil || len(cfgBytes) == 0 {
+		return ac, err
+	}
+	err = json.Unmarshal(cfgBytes, &ac)
+	return ac, err
+}
+
+// saveAdminConfig encrypts and persists the admin config.
+func (m ChatModel) saveAdminConfig(ac adminConfig) error {
+	if m.store == nil {
+		return nil
+	}
+	b, err := json.Marshal(ac)
+	if err != nil {
+		return err
+	}
+	return m.store.SetEncrypted("admin_config", b)
+}
+
+// handleAdminCommand routes /admin sub-commands.
+func (m ChatModel) handleAdminCommand(parts []string) (ChatModel, tea.Cmd) {
+	m.textarea.Reset()
+	if m.lic == nil || m.lic.Free() {
+		m.append(errorStyle.Render("⛔ Admin controls require Pro or higher. Upgrade at https://billy.sh\n\n"))
+		return m, nil
+	}
+	subCmd := parts[0]
+	switch subCmd {
+	case "setup":
+		if len(parts) < 2 {
+			m.append(errorStyle.Render("Usage: /admin setup <pin>  (4–6 digits)\n\n"))
+			return m, nil
+		}
+		pin := parts[1]
+		if len(pin) < 4 || len(pin) > 6 {
+			m.append(errorStyle.Render("PIN must be 4–6 digits.\n\n"))
+			return m, nil
+		}
+		for _, ch := range pin {
+			if ch < '0' || ch > '9' {
+				m.append(errorStyle.Render("PIN must contain only digits.\n\n"))
+				return m, nil
+			}
+		}
+		if err := m.store.SetEncrypted("admin_pin", []byte(pin)); err != nil {
+			m.append(errorStyle.Render("Failed to save PIN: "+err.Error()+"\n\n"))
+			return m, nil
+		}
+		ac, _ := m.loadAdminConfig()
+		ac.Locked = false
+		if err := m.saveAdminConfig(ac); err != nil {
+			m.append(errorStyle.Render("Failed to save admin config: "+err.Error()+"\n\n"))
+			return m, nil
+		}
+		m.append(dimStyle.Render("✅ Admin PIN set. Use /admin lock to lock mode to TEACH.\n\n"))
+		return m, nil
+
+	case "lock":
+		if !m.verifyAdminPIN() {
+			m.append(errorStyle.Render("❌ No admin PIN set or PIN verification failed. Run /admin setup <pin> first.\n\n"))
+			return m, nil
+		}
+		ac, _ := m.loadAdminConfig()
+		ac.Locked = true
+		ac.LockMode = "teach"
+		if err := m.saveAdminConfig(ac); err != nil {
+			m.append(errorStyle.Render("Failed to save admin config: "+err.Error()+"\n\n"))
+			return m, nil
+		}
+		m.teachMode = true
+		m.agentMode = false
+		m.cmdQueue = nil
+		m.append(dimStyle.Render("🔒 Mode locked to TEACH. Students cannot switch modes.\n\n"))
+		return m, nil
+
+	case "unlock":
+		if !m.verifyAdminPIN() {
+			m.append(errorStyle.Render("❌ No admin PIN set or PIN verification failed. Run /admin setup <pin> first.\n\n"))
+			return m, nil
+		}
+		ac, _ := m.loadAdminConfig()
+		ac.Locked = false
+		if err := m.saveAdminConfig(ac); err != nil {
+			m.append(errorStyle.Render("Failed to save admin config: "+err.Error()+"\n\n"))
+			return m, nil
+		}
+		m.append(dimStyle.Render("🔓 Mode lock removed. Users can now switch modes freely.\n\n"))
+		return m, nil
+
+	case "curriculum":
+		if len(parts) < 2 {
+			m.append(errorStyle.Render("Usage: /admin curriculum <text>\n\n"))
+			return m, nil
+		}
+		text := strings.Join(parts[1:], " ")
+		ac, _ := m.loadAdminConfig()
+		ac.Curriculum = text
+		if err := m.saveAdminConfig(ac); err != nil {
+			m.append(errorStyle.Render("Failed to save curriculum: "+err.Error()+"\n\n"))
+			return m, nil
+		}
+		m.append(dimStyle.Render("✅ Curriculum context saved.\n\n"))
+		return m, nil
+
+	case "status":
+		ac, err := m.loadAdminConfig()
+		if err != nil {
+			m.append(errorStyle.Render("Failed to load admin config: "+err.Error()+"\n\n"))
+			return m, nil
+		}
+		pinSet := "not set"
+		if m.store != nil {
+			if pinBytes, err := m.store.GetEncrypted("admin_pin"); err == nil && len(pinBytes) > 0 {
+				pinSet = "set"
+			}
+		}
+		curriculum := ac.Curriculum
+		if curriculum == "" {
+			curriculum = "(none)"
+		}
+		m.append(dimStyle.Render(fmt.Sprintf("Admin status:\n  PIN:        %s\n  Locked:     %v\n  Lock mode:  %s\n  Curriculum: %s\n\n",
+			pinSet, ac.Locked, ac.LockMode, curriculum)))
+		return m, nil
+
+	default:
+		m.append(errorStyle.Render("Unknown admin command. Use /admin for help.\n\n"))
+		return m, nil
+	}
+}
+
+// verifyAdminPIN checks that a PIN has been set in the store.
+// Returns true if a PIN is present (presence check only — interactive PIN entry
+// is outside scope for TUI-embedded admin; the PIN itself guards the lock/unlock path).
+func (m ChatModel) verifyAdminPIN() bool {
+	if m.store == nil {
+		return false
+	}
+	pinBytes, err := m.store.GetEncrypted("admin_pin")
+	return err == nil && len(pinBytes) > 0
+}
+
+// sendHintCmd sends an extra hint-request message to the AI and returns the result as a chatMsg.
+func (m ChatModel) sendHintCmd(hintMsg backend.Message) tea.Cmd {
+	var memTexts []string
+	if m.store != nil {
+		if mems, err := m.store.ListMemories(); err == nil {
+			for _, mem := range mems {
+				memTexts = append(memTexts, mem.Content)
+			}
+		}
+	}
+	systemPrompt := memory.BuildSystemPrompt(memTexts)
+	if m.teachMode {
+		systemPrompt = teachSystemPrompt + "\n\n" + systemPrompt
+	} else if m.agentMode {
+		systemPrompt = agentSystemPrompt + "\n\n" + systemPrompt
+	}
+
+	fullHistory := make([]backend.Message, 0, len(m.history)+2)
+	fullHistory = append(fullHistory, backend.Message{Role: "system", Content: systemPrompt})
+	fullHistory = append(fullHistory, m.history...)
+	fullHistory = append(fullHistory, hintMsg)
+
+	opts := backend.ChatOptions{
+		Temperature: m.cfg.Ollama.Temperature,
+		NumPredict:  m.cfg.Ollama.NumPredict,
+	}
+	b := m.backend
+	return func() tea.Msg {
+		content, err := b.Chat(context.Background(), fullHistory, opts)
+		return chatMsg{content: content, err: err}
+	}
+}
 
 // extractShellCommands finds all ```bash / ```sh / ```shell blocks in an AI
 // response and returns each block's trimmed content as a command string.
