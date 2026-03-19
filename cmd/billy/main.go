@@ -4,12 +4,14 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/jonathanforrider/billy/internal/backend"
 	"github.com/jonathanforrider/billy/internal/config"
 	"github.com/jonathanforrider/billy/internal/launcher"
+	"github.com/jonathanforrider/billy/internal/license"
 	"github.com/jonathanforrider/billy/internal/oneshot"
 	"github.com/jonathanforrider/billy/internal/store"
 	"github.com/jonathanforrider/billy/internal/tui"
@@ -58,13 +60,24 @@ func main() {
 		defer s.Close()
 	}
 
-	b := backend.NewOllama(cfg.Backend.URL, cfg.Ollama.Model)
+	lic, _ := license.LoadCached(s)
+	b, err := backend.NewFromConfig(cfg, lic)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error configuring backend: %v\n", err)
+		os.Exit(1)
+	}
 
-	stopOllama, _, launchErr := launcher.EnsureRunning(context.Background(), cfg.Backend.URL)
-	if launchErr != nil {
-		fmt.Fprintf(os.Stderr, "\n⚠️  %s\n\n", launchErr.Error())
-	} else {
-		defer stopOllama()
+	if backend.ShouldAutoLaunchOllama(cfg) {
+		launchURL := strings.TrimSpace(cfg.Backend.URL)
+		if launchURL == "" {
+			launchURL = "http://localhost:11434"
+		}
+		stopOllama, _, launchErr := launcher.EnsureRunning(context.Background(), launchURL)
+		if launchErr != nil {
+			fmt.Fprintf(os.Stderr, "\n⚠️  %s\n\n", launchErr.Error())
+		} else {
+			defer stopOllama()
+		}
 	}
 
 	m := tui.New(cfg, b, s)

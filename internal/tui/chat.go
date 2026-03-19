@@ -58,6 +58,7 @@ type pickerItem struct {
 
 var commandList = []pickerItem{
 	{"/activate", "Activate a Billy license key (prompts for key)", false},
+	{"/backend", "Show backend status or reload backend config", false},
 	{"/cd", "Change working directory (autocompletes paths)", true},
 	{"/clear", "Clear the current chat", false},
 	{"/compact", "Summarize and compress context", false},
@@ -240,6 +241,86 @@ func validateLicenseCmd(key, instanceID string) tea.Cmd {
 	}
 }
 
+func backendConfigPath() string {
+	if v := os.Getenv("BILLY_CONFIG"); v != "" {
+		return v
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "~/.localai/config.toml"
+	}
+	return filepath.Join(home, ".localai", "config.toml")
+}
+
+func (m *ChatModel) persistCurrentModel(model string) error {
+	if backend.IsOllamaBackend(m.backend) {
+		m.cfg.Ollama.Model = model
+	} else {
+		m.cfg.Backend.Model = model
+	}
+	return config.Save(m.cfg)
+}
+
+func (m ChatModel) reloadBackendFromConfig() (ChatModel, error) {
+	cfg, err := config.Load()
+	if err != nil {
+		return m, err
+	}
+
+	b, err := backend.NewFromConfig(cfg, m.lic)
+	if err != nil {
+		return m, err
+	}
+
+	m.cfg = cfg
+	m.backend = b
+	m.conversationID = ""
+	m.history = nil
+	m.tokenEstimate = 0
+	return m, nil
+}
+
+func (m ChatModel) renderBackendStatus() string {
+	configuredType := backend.NormalizeType(m.cfg.Backend.Type)
+	if configuredType == "" {
+		configuredType = "ollama"
+	}
+
+	configuredURL := strings.TrimSpace(m.cfg.Backend.URL)
+	if configuredURL == "" && configuredType == "ollama" {
+		configuredURL = "http://localhost:11434"
+	}
+
+	configuredModel := backend.ResolveModel(m.cfg)
+	if configuredModel == "" {
+		configuredModel = "(unset)"
+	}
+
+	var sb strings.Builder
+	sb.WriteString("\nBackend status:\n")
+	sb.WriteString(fmt.Sprintf("  Active:     %s\n", m.backend.Name()))
+	sb.WriteString(fmt.Sprintf("  Configured: %s\n", configuredType))
+	sb.WriteString(fmt.Sprintf("  URL:        %s\n", configuredURL))
+	sb.WriteString(fmt.Sprintf("  Model:      %s\n", configuredModel))
+	if strings.TrimSpace(m.cfg.Backend.APIKey) != "" || os.Getenv("BILLY_API_KEY") != "" {
+		sb.WriteString("  API key:    set\n")
+	} else {
+		sb.WriteString("  API key:    not set\n")
+	}
+	sb.WriteString("\nUsage:\n")
+	sb.WriteString("  /backend          Show this status\n")
+	sb.WriteString("  /backend reload   Reload ~/.localai/config.toml and rebuild the backend\n")
+	sb.WriteString("\nConfig file:\n")
+	sb.WriteString(fmt.Sprintf("  %s\n", backendConfigPath()))
+	if m.lic == nil || m.lic.Free() {
+		sb.WriteString("\nPaid tiers can use backend.type = \"custom\" with an OpenAI-compatible endpoint.\n")
+	} else {
+		sb.WriteString("\nPaid tiers can set backend.type = \"custom\" for OpenAI-compatible endpoints.\n")
+	}
+	sb.WriteString("\n")
+	return sb.String()
+}
+
 // estimateTokens gives a rough token count for the history (4 chars ≈ 1 token).
 func estimateTokens(history []backend.Message) int {
 	total := 0
@@ -320,8 +401,8 @@ func New(cfg *config.Config, b backend.Backend, s *store.Store) ChatModel {
 	sp.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("5"))
 
 	welcome := dimStyle.Render(fmt.Sprintf(
-		"  Billy.sh 🐐  —  Model: %s\n  Type your message and press Enter. Use /help to see commands.\n\n",
-		b.CurrentModel(),
+		"  Billy.sh 🐐  —  Backend: %s  ·  Model: %s\n  Type your message and press Enter. Use /help to see commands.\n\n",
+		b.Name(), b.CurrentModel(),
 	))
 
 	vp := viewport.New(80, 20)
@@ -1192,7 +1273,15 @@ func (m ChatModel) handleCommand(input string) (ChatModel, tea.Cmd) {
 					} else {
 						_ = m.store.SetEncrypted("ls_activation", []byte{})
 						m.lic = nil
-						m.append(dimStyle.Render("✅ License deactivated. This machine's seat has been freed.\nYou can activate on another machine or re-activate here anytime.\n\n"))
+						if !backend.IsOllamaBackend(m.backend) {
+							m.backend = backend.NewOllama("http://localhost:11434", m.cfg.Ollama.Model)
+							m.conversationID = ""
+							m.history = nil
+							m.tokenEstimate = 0
+							m.append(dimStyle.Render("✅ License deactivated. This machine's seat has been freed.\nPaid custom-backend access has been disabled for this session, and Billy has fallen back to local Ollama.\n\n"))
+						} else {
+							m.append(dimStyle.Render("✅ License deactivated. This machine's seat has been freed.\nYou can activate on another machine or re-activate here anytime.\n\n"))
+						}
 					}
 				}
 			}
@@ -1215,6 +1304,29 @@ func (m ChatModel) handleCommand(input string) (ChatModel, tea.Cmd) {
 			m.append(dimStyle.Render(fmt.Sprintf("✅ License: %s tier%s%s\nAll features unlocked. 🐐\nUse /deactivate to free this seat.\n\n",
 				strings.ToUpper(string(m.lic.EffectiveTier())), emailStr, seatsStr)))
 		}
+		m.textarea.Reset()
+		return m, nil
+
+	case "/backend":
+		if len(parts) == 1 {
+			m.append(dimStyle.Render(m.renderBackendStatus()))
+			m.textarea.Reset()
+			return m, nil
+		}
+		if parts[1] != "reload" {
+			m.append(errorStyle.Render("Usage: /backend  or  /backend reload\n\n"))
+			m.textarea.Reset()
+			return m, nil
+		}
+
+		reloaded, err := m.reloadBackendFromConfig()
+		if err != nil {
+			m.append(errorStyle.Render("Could not reload backend: " + err.Error() + "\n\n"))
+			m.textarea.Reset()
+			return m, nil
+		}
+		m = reloaded
+		m.append(dimStyle.Render(fmt.Sprintf("✅ Reloaded backend: %s · %s\nConversation context reset to avoid cross-provider mixups.\n\n", m.backend.Name(), m.backend.CurrentModel())))
 		m.textarea.Reset()
 		return m, nil
 
@@ -1260,11 +1372,12 @@ func (m ChatModel) handleCommand(input string) (ChatModel, tea.Cmd) {
 Commands:
   /help              Show this help
   /activate          Activate a Billy license key (interactive prompt)
+  /backend [reload]  Show backend status or reload backend config
   /license           Show current license / tier status
   /mode [agent|chat] Switch mode (current: %s)
   /model             List installed models (active model highlighted)
   /model <name>      Switch to a different model
-  /pull <name>       Download a new model from Ollama library
+  /pull <name>       Download a new model from Ollama (local backend only)
   /models            Alias for /model
   /memory            List everything Billy remembers about you
   /memory forget <id> Delete a specific memory
@@ -1367,29 +1480,46 @@ Popular models to pull:
 			if err != nil {
 				m.append(errorStyle.Render("Error listing models: "+err.Error()) + "\n\n")
 			} else if len(models) == 0 {
-				m.append(dimStyle.Render("No models found. Use /pull <name> to download one.\n\n"))
+				if backend.IsOllamaBackend(m.backend) {
+					m.append(dimStyle.Render("No models found. Use /pull <name> to download one.\n\n"))
+				} else {
+					m.append(dimStyle.Render("No models were returned by the current backend.\nSet backend.model manually if your provider does not expose /models.\n\n"))
+				}
 			} else {
 				var sb strings.Builder
-				sb.WriteString("\nInstalled models (use /model <name> to switch):\n")
-				for i, mo := range models {
+				sb.WriteString("\nAvailable models (use /model <name> to switch):\n")
+				for _, mo := range models {
 					active := "  "
 					if mo.Name == m.backend.CurrentModel() {
 						active = "▶ "
 					}
 					sb.WriteString(fmt.Sprintf("  %s%-32s %s\n", active, mo.Name, dimStyle.Render(mo.Size)))
-					_ = i
 				}
-				sb.WriteString("\n  Use /pull <name> to download a new model.\n\n")
+				if backend.IsOllamaBackend(m.backend) {
+					sb.WriteString("\n  Use /pull <name> to download a new model.\n\n")
+				} else {
+					sb.WriteString("\n  This backend only switches between models it already exposes.\n\n")
+				}
 				m.append(dimStyle.Render(sb.String()))
 			}
 		} else {
-			m.backend.SetModel(parts[1])
+			modelName := parts[1]
+			m.backend.SetModel(modelName)
 			m.conversationID = ""
 			m.history = nil
-			m.append(dimStyle.Render(fmt.Sprintf("Switched to model: %s\n\n", parts[1])))
+			m.tokenEstimate = 0
+			if err := m.persistCurrentModel(modelName); err != nil {
+				m.append(errorStyle.Render("Switched model, but could not save config: " + err.Error() + "\n\n"))
+				return m, nil
+			}
+			m.append(dimStyle.Render(fmt.Sprintf("Switched to model: %s\n\n", modelName)))
 		}
 
 	case "/pull":
+		if !backend.IsOllamaBackend(m.backend) {
+			m.append(errorStyle.Render("Model downloads are only available with the local Ollama backend.\nUse /backend to inspect your current provider.\n\n"))
+			return m, nil
+		}
 		if len(parts) < 2 {
 			m.append(dimStyle.Render("Usage: /pull <model-name>\nExample: /pull mistral\n\nPopular models:\n  mistral · llama3 · codellama · phi3 · gemma · neural-chat\n\nFind more at: https://ollama.com/library\n\n"))
 		} else {
