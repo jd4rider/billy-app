@@ -647,12 +647,12 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Freemium limits
 			if (m.lic == nil || m.lic.Free()) && m.msgCount >= 20 {
 				m.append(errorStyle.Render("⛔ Free tier limit reached (20 messages/session).\n\n") +
-					dimStyle.Render("Upgrade to Pro for unlimited conversations:\n  https://billy.sh/upgrade\n\nOr use /activate to enter an existing license.\n\n"))
+					dimStyle.Render("Upgrade to Pro for unlimited conversations:\n  https://billysh.online\n\nOr use /activate to enter an existing license.\n\n"))
 				m.textarea.Reset()
 				return m, nil
 			}
 			if (m.lic == nil || m.lic.Free()) && m.msgCount == 15 {
-				m.append(dimStyle.Render("⚠️  Approaching free tier limit (15/20 messages). Upgrade to Pro for unlimited: https://billy.sh/upgrade\n\n"))
+				m.append(dimStyle.Render("⚠️  Approaching free tier limit (15/20 messages). Upgrade to Pro for unlimited: https://billysh.online\n\n"))
 			}
 			m.msgCount++
 
@@ -1314,7 +1314,7 @@ func (m ChatModel) handleCommand(input string) (ChatModel, tea.Cmd) {
 
 	case "/license":
 		if m.lic == nil || m.lic.Free() {
-			m.append(dimStyle.Render("🔓 License: FREE tier\n\nLimits:\n• 20 messages per session\n• Memory not persisted between sessions\n• History limited to 5 conversations\n\nUpgrade at https://billy.sh\nUse /activate to enter a license key.\n\n"))
+			m.append(dimStyle.Render("🔓 License: FREE tier\n\nLimits:\n• 20 messages per session\n• Memory not persisted between sessions\n• History limited to 5 conversations\n\nUpgrade at https://billysh.online\nUse /activate to enter a license key.\n\n"))
 		} else {
 			seatsStr := ""
 			if m.lic.Seats > 0 {
@@ -2127,7 +2127,7 @@ func (m ChatModel) saveAdminConfig(ac adminConfig) error {
 func (m ChatModel) handleAdminCommand(parts []string) (ChatModel, tea.Cmd) {
 	m.textarea.Reset()
 	if m.lic == nil || m.lic.Free() {
-		m.append(errorStyle.Render("⛔ Admin controls require Pro or higher. Upgrade at https://billy.sh\n\n"))
+		m.append(errorStyle.Render("⛔ Admin controls require Pro or higher. Upgrade at https://billysh.online\n\n"))
 		return m, nil
 	}
 	subCmd := parts[0]

@@ -260,7 +260,7 @@ The current mode and working directory are shown in the status bar at the bottom
 | **Team** | ~$14/seat | Bulk seats, shared memory, admin controls |
 | **Enterprise** | Custom | Unlimited seats, self-hosted, SLA — call [406-396-7246](tel:+14063967246) |
 
-Upgrade at **[billy.sh](https://jd4rider.github.io/billy-web)**, then run `/activate` inside Billy.
+Upgrade at **[billysh.online](https://billysh.online)**, then run `/activate` inside Billy.
 
 ---
 
@@ -326,8 +326,8 @@ billy
 | ✅ | Lemon Squeezy activation with encrypted local activation storage |
 | ✅ | Binary distribution — slim + fat (bundled Ollama) |
 | ✅ | Homebrew tap, Scoop bucket, .deb/.rpm/.apk packages |
-| ✅ | [billy.sh](https://jd4rider.github.io/billy-web) landing page live |
-| ✅ | [Starlight docs site](https://jd4rider.github.io/billy-starlight) |
+| ✅ | [billysh.online](https://billysh.online) landing page live |
+| ✅ | [Starlight docs site](https://docs.billysh.online) |
 | ✅ | One-shot CLI mode (`billy "prompt"`, `billy read/explain/fix/run`) |
 | ✅ | Paid custom / OpenAI-compatible HTTP backends |
 | ✅ | Context compaction (`/compact`) with token estimate in status bar |
