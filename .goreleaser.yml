@@ -97,13 +97,7 @@ release:
 
     This is alpha software. Expect rough edges and occasional breaking changes.
 
-    ### Variants
-    | Build | Ollama | Size |
-    |---|---|---|
-    | `billy_*` (slim) | Requires separate Ollama install | ~10 MB |
-    | `billy-full_*` (full) | Ollama bundled, auto-starts | ~80 MB |
-
-    ### Quick Install (slim)
+    ### Quick Install
     ```bash
     curl -fsSL https://raw.githubusercontent.com/jd4rider/billy-app/main/scripts/install.sh | bash
     ```
