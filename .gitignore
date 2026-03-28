@@ -1,6 +1,7 @@
 # Binaries
 /billy
 /billy-full
+/dist
 *.exe
 
 # Fat build - downloaded at build time
