@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -51,6 +52,10 @@ var (
 			BorderForeground(lipgloss.Color("5"))
 )
 
+const defaultPromptPlaceholder = "Ask Billy anything... (/help, /model, Ctrl+D to quit)"
+const backendRequestTimeout = 90 * time.Second
+const pwdMarker = "__BILLY_PWD__:"
+
 type pickerItem struct {
 	cmd     string
 	desc    string
@@ -58,19 +63,17 @@ type pickerItem struct {
 }
 
 var commandList = []pickerItem{
-	{"/activate", "Activate a Billy license key (prompts for key)", false},
-	{"/admin", "Admin controls: PIN, mode lock, curriculum (Pro+)", true},
+	{"/admin", "Admin controls: PIN, mode lock, curriculum", true},
 	{"/backend", "Show backend status or reload backend config", false},
 	{"/cd", "Change working directory (autocompletes paths)", true},
 	{"/clear", "Clear the current chat", false},
 	{"/compact", "Summarize and compress context", false},
-	{"/deactivate", "Deactivate license on this machine (frees your seat)", false},
 	{"/explain", "Explain what a shell command does", true},
 	{"/git", "Show git status and recent commits", false},
 	{"/help", "Show all commands", false},
 	{"/hint", "Request a more specific hint (teach mode)", false},
 	{"/history", "Browse past conversations", false},
-	{"/license", "Show current license / tier status", false},
+	{"/license", "Show Billy's current open-core access model", false},
 	{"/ls", "List files in current (or given) directory", true},
 	{"/memory", "List or manage memories", false},
 	{"/mode", "Switch between agent, chat, and teach mode", true},
@@ -83,6 +86,7 @@ var commandList = []pickerItem{
 	{"/save", "Save current conversation", false},
 	{"/session", "Save a session checkpoint", false},
 	{"/suggest", "Suggest a shell command for a task", true},
+	{"/yolo", "Toggle auto-approve for all commands this session", false},
 }
 
 func filterCommands(input string) []pickerItem {
@@ -255,6 +259,60 @@ func backendConfigPath() string {
 	return filepath.Join(home, ".localai", "config.toml")
 }
 
+func configuredBackendURL(cfg *config.Config) string {
+	configuredURL := strings.TrimSpace(cfg.Backend.URL)
+	if configuredURL == "" && backend.NormalizeType(cfg.Backend.Type) == "ollama" {
+		configuredURL = "http://localhost:11434"
+	}
+	return configuredURL
+}
+
+func backendReachable(rawURL string) bool {
+	if strings.TrimSpace(rawURL) == "" {
+		return false
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return false
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return false
+	}
+	resp.Body.Close()
+	return true
+}
+
+func welcomeContent(cfg *config.Config, b backend.Backend) string {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("  Billy 🐐  —  Backend: %s  ·  Model: %s\n", b.Name(), b.CurrentModel()))
+
+	if backend.IsOllamaBackend(b) && !backendReachable(configuredBackendURL(cfg)) {
+		sb.WriteString("  Ollama is not reachable yet.\n\n")
+		if backend.ShouldAutoLaunchOllama(cfg) {
+			sb.WriteString("  Start here:\n")
+			sb.WriteString("  1. Install or start Ollama: https://ollama.com\n")
+			sb.WriteString("  2. Pull a model: ollama pull qwen2.5-coder:14b\n")
+			sb.WriteString("  3. Then run /backend reload or reopen Billy\n\n")
+		} else {
+			sb.WriteString("  Check your configured Ollama URL, then run /backend reload.\n\n")
+		}
+		sb.WriteString("  Commands: /help  ·  /backend  ·  /model\n\n")
+		return dimStyle.Render(sb.String())
+	}
+
+	if backend.IsOllamaBackend(b) {
+		sb.WriteString("  Try: explain this repository  ·  /model  ·  /pull qwen2.5-coder:14b\n\n")
+	} else {
+		sb.WriteString("  Try: explain this repository  ·  /backend  ·  /model\n\n")
+	}
+	return dimStyle.Render(sb.String())
+}
+
 func (m *ChatModel) persistCurrentModel(model string) error {
 	if backend.IsOllamaBackend(m.backend) {
 		m.cfg.Ollama.Model = model
@@ -289,14 +347,16 @@ func (m ChatModel) renderBackendStatus() string {
 		configuredType = "ollama"
 	}
 
-	configuredURL := strings.TrimSpace(m.cfg.Backend.URL)
-	if configuredURL == "" && configuredType == "ollama" {
-		configuredURL = "http://localhost:11434"
-	}
+	configuredURL := configuredBackendURL(m.cfg)
 
 	configuredModel := backend.ResolveModel(m.cfg)
 	if configuredModel == "" {
 		configuredModel = "(unset)"
+	}
+
+	ollamaReachable := false
+	if configuredType == "ollama" {
+		ollamaReachable = backendReachable(configuredURL)
 	}
 
 	var sb strings.Builder
@@ -305,6 +365,13 @@ func (m ChatModel) renderBackendStatus() string {
 	sb.WriteString(fmt.Sprintf("  Configured: %s\n", configuredType))
 	sb.WriteString(fmt.Sprintf("  URL:        %s\n", configuredURL))
 	sb.WriteString(fmt.Sprintf("  Model:      %s\n", configuredModel))
+	if configuredType == "ollama" {
+		if ollamaReachable {
+			sb.WriteString("  Reachable:   yes\n")
+		} else {
+			sb.WriteString("  Reachable:   no\n")
+		}
+	}
 	if strings.TrimSpace(m.cfg.Backend.APIKey) != "" || os.Getenv("BILLY_API_KEY") != "" {
 		sb.WriteString("  API key:    set\n")
 	} else {
@@ -315,11 +382,19 @@ func (m ChatModel) renderBackendStatus() string {
 	sb.WriteString("  /backend reload   Reload ~/.localai/config.toml and rebuild the backend\n")
 	sb.WriteString("\nConfig file:\n")
 	sb.WriteString(fmt.Sprintf("  %s\n", backendConfigPath()))
-	if m.lic == nil || m.lic.Free() {
-		sb.WriteString("\nPaid tiers can use backend.type = \"custom\" with an OpenAI-compatible endpoint.\n")
-	} else {
-		sb.WriteString("\nPaid tiers can set backend.type = \"custom\" for OpenAI-compatible endpoints.\n")
+	if configuredType == "ollama" && !ollamaReachable {
+		sb.WriteString("\nNext steps:\n")
+		if backend.ShouldAutoLaunchOllama(m.cfg) {
+			sb.WriteString("  1. Install or start Ollama: https://ollama.com\n")
+			sb.WriteString("  2. Pull a model: ollama pull qwen2.5-coder:14b\n")
+			sb.WriteString("  3. Then run /backend reload\n")
+		} else {
+			sb.WriteString("  1. Verify backend.url points at your Ollama server\n")
+			sb.WriteString("  2. Make sure that server is running and reachable\n")
+			sb.WriteString("  3. Then run /backend reload\n")
+		}
 	}
+	sb.WriteString("\nBilly currently ships fully unlocked. Custom OpenAI-compatible endpoints work in the open-core build too.\n")
 	sb.WriteString("\n")
 	return sb.String()
 }
@@ -384,6 +459,9 @@ type ChatModel struct {
 	collapsedOutputs        []collapsedOutput // folded long command outputs
 	cmdQueue                []string          // AI-suggested commands pending permission
 	agentMode               bool              // true = agentic (default), false = chat only
+	autopilotMode           bool              // true = auto-run commands and keep iterating
+	lastAutoCommandSig      string            // normalized signature of last successful autopilot batch
+	lastAutoCommandSuccess  bool              // true if the last autopilot batch had no shell error
 	teachMode               bool              // true = teach mode (show commands, don't run)
 	tokenEstimate           int               // rough token count for current history
 	compacted               bool              // true if history has been compacted
@@ -393,7 +471,7 @@ type ChatModel struct {
 // New creates a new ChatModel.
 func New(cfg *config.Config, b backend.Backend, s *store.Store) ChatModel {
 	ta := textarea.New()
-	ta.Placeholder = "Ask Billy anything... (Enter to send, Ctrl+D to quit)"
+	ta.Placeholder = defaultPromptPlaceholder
 	ta.Focus()
 	ta.SetWidth(80)
 	ta.SetHeight(3)
@@ -404,10 +482,7 @@ func New(cfg *config.Config, b backend.Backend, s *store.Store) ChatModel {
 	sp.Spinner = spinner.Dot
 	sp.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("5"))
 
-	welcome := dimStyle.Render(fmt.Sprintf(
-		"  Billy.sh 🐐  —  Backend: %s  ·  Model: %s\n  Type your message and press Enter. Use /help to see commands.\n\n",
-		b.Name(), b.CurrentModel(),
-	))
+	welcome := welcomeContent(cfg, b)
 
 	vp := viewport.New(80, 20)
 	vp.SetContent(welcome)
@@ -430,20 +505,6 @@ func New(cfg *config.Config, b backend.Backend, s *store.Store) ChatModel {
 
 	if wd, err := os.Getwd(); err == nil {
 		m.workDir = wd
-	}
-
-	// Load license from encrypted activation cache; re-validate in background if stale
-	if s != nil {
-		if actBytes, err := s.GetEncrypted("ls_activation"); err == nil && len(actBytes) > 0 {
-			if act, err := license.UnmarshalActivation(actBytes); err == nil {
-				m.lic = act.ToLicense()
-				if time.Since(act.ValidatedAt) > 7*24*time.Hour {
-					m.pendingValidation = true
-					m.pendingValidationKey = act.Key
-					m.pendingValidationInstID = act.InstanceID
-				}
-			}
-		}
 	}
 
 	return m
@@ -501,14 +562,14 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch msg.Type {
 			case tea.KeyEsc, tea.KeyCtrlC:
 				m.activating = false
-				m.textarea.Placeholder = "Ask Billy anything... (Enter to send, Ctrl+D to quit)"
+				m.textarea.Placeholder = defaultPromptPlaceholder
 				m.textarea.Reset()
 				m.append(dimStyle.Render("Activation cancelled.\n\n"))
 				return m, nil
 			case tea.KeyEnter:
 				key := strings.TrimSpace(m.textarea.Value())
 				m.activating = false
-				m.textarea.Placeholder = "Ask Billy anything... (Enter to send, Ctrl+D to quit)"
+				m.textarea.Placeholder = defaultPromptPlaceholder
 				m.textarea.Reset()
 				if key == "" {
 					m.append(errorStyle.Render("❌ No key entered. Use /activate to try again.\n\n"))
@@ -568,7 +629,7 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m, cmd := m.flushCmdOutputs()
 					return m, cmd
 				}
-				m.textarea.Placeholder = "Ask Billy anything... (Enter to send, Ctrl+D to quit)"
+				m.textarea.Placeholder = defaultPromptPlaceholder
 				m.textarea.Reset()
 				return m, nil
 			case tea.KeyEsc:
@@ -576,7 +637,7 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.shellPickerIdx = 0
 				m.cmdQueue = nil
 				m.pendingCmdOutputs = nil
-				m.textarea.Placeholder = "Ask Billy anything... (Enter to send, Ctrl+D to quit)"
+				m.textarea.Placeholder = defaultPromptPlaceholder
 				m.textarea.Reset()
 				m.append(dimStyle.Render("Skipped.\n\n"))
 				return m, nil
@@ -644,16 +705,6 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m.handleCommand(input)
 			}
 
-			// Freemium limits
-			if (m.lic == nil || m.lic.Free()) && m.msgCount >= 20 {
-				m.append(errorStyle.Render("⛔ Free tier limit reached (20 messages/session).\n\n") +
-					dimStyle.Render("Upgrade to Pro for unlimited conversations:\n  https://billysh.online\n\nOr use /activate to enter an existing license.\n\n"))
-				m.textarea.Reset()
-				return m, nil
-			}
-			if (m.lic == nil || m.lic.Free()) && m.msgCount == 15 {
-				m.append(dimStyle.Render("⚠️  Approaching free tier limit (15/20 messages). Upgrade to Pro for unlimited: https://billysh.online\n\n"))
-			}
 			m.msgCount++
 
 			// Natural language memory detection
@@ -681,6 +732,8 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				_ = m.store.CreateConversation(m.conversationID, title, m.backend.CurrentModel())
 			}
 
+			m.lastAutoCommandSig = ""
+			m.lastAutoCommandSuccess = false
 			m.history = append(m.history, backend.Message{Role: "user", Content: input})
 			m.tokenEstimate = estimateTokens(m.history)
 			m.append(userStyle.Render("You >") + " " + input + "\n\n")
@@ -741,6 +794,13 @@ func (m ChatModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.agentMode {
 				cmds := extractShellCommands(msg.content)
 				if len(cmds) > 0 {
+					sig := normalizeCommandBatch(cmds)
+					if m.autopilotMode && m.lastAutoCommandSuccess && sig != "" && sig == m.lastAutoCommandSig {
+						m.append(dimStyle.Render("🛑 Autopilot stopped to avoid repeating the same successful command batch.\nBilly believes the task is already complete.\n\n"))
+						m.lastAutoCommandSig = ""
+						m.lastAutoCommandSuccess = false
+						return m, nil
+					}
 					m.cmdQueue = append(m.cmdQueue, cmds...)
 					m = m.promptNextQueuedCmd()
 					// If shellAlways drained the whole queue, flush outputs now
@@ -938,6 +998,8 @@ func (m ChatModel) View() string {
 		switch {
 		case m.teachMode:
 			modeBadge = lipgloss.NewStyle().Foreground(lipgloss.Color("#4ade80")).Bold(true).Render("[TEACH]")
+		case m.autopilotMode:
+			modeBadge = lipgloss.NewStyle().Foreground(lipgloss.Color("#f59e0b")).Bold(true).Render("[AUTO]")
 		case m.agentMode:
 			modeBadge = lipgloss.NewStyle().Foreground(lipgloss.Color("#38bdf8")).Bold(true).Render("[AGENT]")
 		default:
@@ -973,22 +1035,8 @@ func (m ChatModel) View() string {
 }
 
 // licenseBadge returns a styled tier badge for the status bar.
-func licenseBadge(lic *license.License) string {
-	if lic == nil || lic.Free() {
-		return lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render("[FREE]")
-	}
-	switch lic.EffectiveTier() {
-	case license.TierPro:
-		return lipgloss.NewStyle().Foreground(lipgloss.Color("#38bdf8")).Bold(true).Render("[PRO]")
-	case license.TierPremium:
-		return lipgloss.NewStyle().Foreground(lipgloss.Color("#f59e0b")).Bold(true).Render("[PREMIUM]")
-	case license.TierTeam:
-		return lipgloss.NewStyle().Foreground(lipgloss.Color("#a855f7")).Bold(true).Render("[TEAM]")
-	case license.TierEnterprise:
-		return lipgloss.NewStyle().Foreground(lipgloss.Color("#22c55e")).Bold(true).Render("[ENTERPRISE]")
-	default:
-		return lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render("[FREE]")
-	}
+func licenseBadge(_ *license.License) string {
+	return lipgloss.NewStyle().Foreground(lipgloss.Color("#4ade80")).Bold(true).Render("[OPEN]")
 }
 
 // renderTokenBar renders a compact coloured context-fill bar for the status line.
@@ -1214,7 +1262,7 @@ func (m ChatModel) loadConversation(id string) (ChatModel, tea.Cmd) {
 	m.conversationID = id
 	m.history = nil
 	m.content = dimStyle.Render(fmt.Sprintf(
-		"  Billy.sh 🐐  —  Resumed conversation  ·  Model: %s\n\n",
+		"  Billy 🐐  —  Resumed conversation  ·  Model: %s\n\n",
 		m.backend.CurrentModel(),
 	)) + "\n"
 
@@ -1263,7 +1311,9 @@ func (m ChatModel) sendChat() tea.Cmd {
 	}
 	b := m.backend
 	return func() tea.Msg {
-		content, err := b.Chat(context.Background(), fullHistory, opts)
+		ctx, cancel := context.WithTimeout(context.Background(), backendRequestTimeout)
+		defer cancel()
+		content, err := b.Chat(ctx, fullHistory, opts)
 		return chatMsg{content: content, err: err}
 	}
 }
@@ -1275,58 +1325,17 @@ func (m ChatModel) handleCommand(input string) (ChatModel, tea.Cmd) {
 
 	switch cmd {
 	case "/activate":
-		// Enter activation mode — intercept next Enter in Update()
-		m.activating = true
 		m.textarea.Reset()
-		m.textarea.Placeholder = "Paste your LemonSqueezy license key and press Enter (Esc to cancel)..."
-		m.append(dimStyle.Render("🔑 Enter your license key and press Enter:\n\n"))
+		m.append(dimStyle.Render("Billy currently ships fully unlocked. No license key is required right now.\nFuture supporter or convenience tiers may return later, but the core tool is open.\n\n"))
 		return m, nil
 
 	case "/deactivate":
-		if m.lic == nil || m.lic.Free() {
-			m.append(dimStyle.Render("No active license on this machine.\n\n"))
-			m.textarea.Reset()
-			return m, nil
-		}
-		if m.store != nil {
-			if actBytes, err := m.store.GetEncrypted("ls_activation"); err == nil && len(actBytes) > 0 {
-				if act, err := license.UnmarshalActivation(actBytes); err == nil {
-					if err := license.Deactivate(act.Key, act.InstanceID); err != nil {
-						m.append(errorStyle.Render("❌ Deactivation failed: " + err.Error() + "\n\n"))
-					} else {
-						_ = m.store.SetEncrypted("ls_activation", []byte{})
-						m.lic = nil
-						if !backend.IsOllamaBackend(m.backend) {
-							m.backend = backend.NewOllama("http://localhost:11434", m.cfg.Ollama.Model)
-							m.conversationID = ""
-							m.history = nil
-							m.tokenEstimate = 0
-							m.append(dimStyle.Render("✅ License deactivated. This machine's seat has been freed.\nPaid custom-backend access has been disabled for this session, and Billy has fallen back to local Ollama.\n\n"))
-						} else {
-							m.append(dimStyle.Render("✅ License deactivated. This machine's seat has been freed.\nYou can activate on another machine or re-activate here anytime.\n\n"))
-						}
-					}
-				}
-			}
-		}
+		m.append(dimStyle.Render("No active license is required right now. Billy is running in open-core mode.\n\n"))
 		m.textarea.Reset()
 		return m, nil
 
 	case "/license":
-		if m.lic == nil || m.lic.Free() {
-			m.append(dimStyle.Render("🔓 License: FREE tier\n\nLimits:\n• 20 messages per session\n• Memory not persisted between sessions\n• History limited to 5 conversations\n\nUpgrade at https://billysh.online\nUse /activate to enter a license key.\n\n"))
-		} else {
-			seatsStr := ""
-			if m.lic.Seats > 0 {
-				seatsStr = fmt.Sprintf("\nSeats: %d", m.lic.Seats)
-			}
-			emailStr := ""
-			if m.lic.Email != "" {
-				emailStr = fmt.Sprintf("\nEmail: %s", m.lic.Email)
-			}
-			m.append(dimStyle.Render(fmt.Sprintf("✅ License: %s tier%s%s\nAll features unlocked. 🐐\nUse /deactivate to free this seat.\n\n",
-				strings.ToUpper(string(m.lic.EffectiveTier())), emailStr, seatsStr)))
-		}
+		m.append(dimStyle.Render("🔓 Billy access: OPEN\n\nIncluded right now:\n• Local Ollama backend\n• Custom OpenAI-compatible endpoints\n• Local history and memory\n• Agentic, autopilot, and admin controls\n• No license key required\n\nIf Billy helps you, support the project at https://billysh.online through setup help, GitHub Sponsors, or Buy Me a Coffee.\nFuture supporter bundles may return later, but the core tool stays open.\n\n"))
 		m.textarea.Reset()
 		return m, nil
 
@@ -1366,12 +1375,14 @@ func (m ChatModel) handleCommand(input string) (ChatModel, tea.Cmd) {
 	case "/mode":
 		if len(parts) < 2 {
 			modeStr := "AGENT"
-			if m.teachMode {
+			if m.autopilotMode {
+				modeStr = "AUTOPILOT"
+			} else if m.teachMode {
 				modeStr = "TEACH"
 			} else if !m.agentMode {
 				modeStr = "CHAT"
 			}
-			m.append(dimStyle.Render(fmt.Sprintf("Current mode: %s\n\n  /mode agent  — Billy detects and offers to run commands\n  /mode chat   — conversation only, no command execution\n  /mode teach  — Billy guides step by step, shows commands for you to type\n\n", modeStr)))
+			m.append(dimStyle.Render(fmt.Sprintf("Current mode: %s\n\n  /mode agent      — Billy detects commands and asks before running them\n  /mode autopilot  — Billy auto-runs suggested commands and keeps iterating\n  /mode chat       — conversation only, no command execution\n  /mode teach      — Billy guides step by step, shows commands for you to type\n\n", modeStr)))
 		} else {
 			// Check admin lock before allowing mode switch
 			if m.store != nil {
@@ -1387,28 +1398,70 @@ func (m ChatModel) handleCommand(input string) (ChatModel, tea.Cmd) {
 			switch parts[1] {
 			case "agent":
 				m.agentMode = true
+				m.autopilotMode = false
+				delete(m.shellAlways, "*")
 				m.teachMode = false
 				m.append(dimStyle.Render("✅ Switched to AGENT mode.\nBilly will detect commands in responses and ask to run them.\n\n"))
+			case "autopilot":
+				m.agentMode = true
+				m.autopilotMode = true
+				m.teachMode = false
+				m.shellAlways["*"] = true
+				m.append(dimStyle.Render("✅ Switched to AUTOPILOT mode.\nBilly will auto-run suggested commands and keep iterating until the task settles.\n\n"))
 			case "chat":
 				m.agentMode = false
+				m.autopilotMode = false
+				delete(m.shellAlways, "*")
 				m.teachMode = false
 				m.cmdQueue = nil
 				m.append(dimStyle.Render("✅ Switched to CHAT mode.\nBilly will answer questions only — no command execution.\n\n"))
 			case "teach":
 				m.teachMode = true
 				m.agentMode = false
+				m.autopilotMode = false
+				delete(m.shellAlways, "*")
 				m.cmdQueue = nil
 				m.append(dimStyle.Render("✅ Switched to TEACH mode.\nBilly will guide you step by step. Shell commands are shown for you to type yourself.\n\n"))
 			default:
-				m.append(errorStyle.Render("Unknown mode. Use: /mode agent  or  /mode chat  or  /mode teach\n\n"))
+				m.append(errorStyle.Render("Unknown mode. Use: /mode agent  or  /mode autopilot  or  /mode chat  or  /mode teach\n\n"))
 			}
+		}
+		m.textarea.Reset()
+		return m, nil
+
+	case "/yolo":
+		if m.store != nil {
+			if cfgBytes, err := m.store.GetEncrypted("admin_config"); err == nil && len(cfgBytes) > 0 {
+				var ac adminConfig
+				if json.Unmarshal(cfgBytes, &ac) == nil && ac.Locked {
+					m.append(errorStyle.Render("⛔ Mode is locked by admin. Contact your administrator.\n\n"))
+					m.textarea.Reset()
+					return m, nil
+				}
+			}
+		}
+		if m.autopilotMode {
+			m.autopilotMode = false
+			delete(m.shellAlways, "*")
+			if !m.teachMode {
+				m.agentMode = true
+			}
+			m.append(dimStyle.Render("🛑 YOLO disabled.\nBilly will ask before running commands again.\n\n"))
+		} else {
+			m.autopilotMode = true
+			m.agentMode = true
+			m.teachMode = false
+			m.shellAlways["*"] = true
+			m.append(dimStyle.Render("🚀 YOLO enabled.\nBilly will auto-run suggested commands for the rest of this session.\nUse /yolo again to turn it off.\n\n"))
 		}
 		m.textarea.Reset()
 		return m, nil
 
 	case "/help":
 		modeStr := "AGENT (default)"
-		if m.teachMode {
+		if m.autopilotMode {
+			modeStr = "AUTOPILOT"
+		} else if m.teachMode {
 			modeStr = "TEACH"
 		} else if !m.agentMode {
 			modeStr = "CHAT"
@@ -1416,14 +1469,14 @@ func (m ChatModel) handleCommand(input string) (ChatModel, tea.Cmd) {
 		m.append(dimStyle.Render(fmt.Sprintf(`
 Commands:
   /help              Show this help
-  /activate          Activate a Billy license key (interactive prompt)
   /backend [reload]  Show backend status or reload backend config
-  /license           Show current license / tier status
-  /mode [agent|chat|teach] Switch mode (current: %s)
+  /license           Show Billy access + support info
+  /mode [agent|autopilot|chat|teach] Switch mode (current: %s)
   /model             List installed models (active model highlighted)
   /model <name>      Switch to a different model
   /pull <name>       Download a new model from Ollama (local backend only)
   /models            Alias for /model
+  /yolo              Toggle auto-approve for all commands this session
   /memory            List everything Billy remembers about you
   /memory forget <id> Delete a specific memory
   /memory clear      Wipe all memories
@@ -1441,7 +1494,7 @@ Commands:
 Teaching mode:
   /teach             Shortcut for /mode teach
   /hint              Ask Billy for a more specific hint (teach mode)
-  /admin             Admin controls (Pro+): PIN, mode lock, curriculum
+  /admin             Admin controls: PIN, mode lock, curriculum
 
 Filesystem:
   /pwd               Print current working directory
@@ -1457,10 +1510,14 @@ Agent mode:
   When Billy suggests a command, a permission prompt appears.
   Press Enter or y=yes  a=always this session  n/s=skip
 
+Autopilot mode:
+  Billy auto-runs suggested commands and feeds output back into the model.
+  Use /mode autopilot or /yolo to enable it.
+
 Natural language memory:
   "Remember that I prefer Go over Python"
   "Note that my name is Jonathan"
-  "Don't forget I'm building Billy.sh"
+  "Don't forget I'm building Billy"
 
 Keyboard:
   PgUp / PgDn        Scroll conversation
@@ -1488,7 +1545,7 @@ Popular models to pull:
 
 	case "/admin":
 		if len(parts) < 2 {
-			m.append(dimStyle.Render("Admin commands (Pro+ only):\n  /admin setup <pin>         — Set up admin PIN\n  /admin lock                — Lock mode to TEACH\n  /admin unlock              — Remove mode lock\n  /admin curriculum <text>   — Set curriculum context\n  /admin status              — Show admin config\n\n"))
+			m.append(dimStyle.Render("Admin commands:\n  /admin setup <pin>         — Set up admin PIN\n  /admin lock                — Lock mode to TEACH\n  /admin unlock              — Remove mode lock\n  /admin curriculum <text>   — Set curriculum context\n  /admin status              — Show admin config\n\n"))
 			m.textarea.Reset()
 			return m, nil
 		}
@@ -1549,7 +1606,7 @@ Popular models to pull:
 				m.append(errorStyle.Render("Error listing models: "+err.Error()) + "\n\n")
 			} else if len(models) == 0 {
 				if backend.IsOllamaBackend(m.backend) {
-					m.append(dimStyle.Render("No models found. Use /pull <name> to download one.\n\n"))
+					m.append(dimStyle.Render("No models found yet.\nTry:\n  /pull qwen2.5-coder:14b\n  /pull llama3.2\n\n"))
 				} else {
 					m.append(dimStyle.Render("No models were returned by the current backend.\nSet backend.model manually if your provider does not expose /models.\n\n"))
 				}
@@ -1589,7 +1646,7 @@ Popular models to pull:
 			return m, nil
 		}
 		if len(parts) < 2 {
-			m.append(dimStyle.Render("Usage: /pull <model-name>\nExample: /pull mistral\n\nPopular models:\n  mistral · llama3 · codellama · phi3 · gemma · neural-chat\n\nFind more at: https://ollama.com/library\n\n"))
+			m.append(dimStyle.Render("Usage: /pull <model-name>\nExample: /pull qwen2.5-coder:14b\n\nPopular models:\n  qwen2.5-coder:14b · qwen2.5-coder:7b · llama3.2 · codellama · mistral\n\nFind more at: https://ollama.com/library\n\n"))
 		} else {
 			modelName := parts[1]
 			m.waiting = true
@@ -1650,10 +1707,7 @@ Popular models to pull:
 	case "/clear":
 		m.history = nil
 		m.conversationID = ""
-		m.content = dimStyle.Render(fmt.Sprintf(
-			"  Billy.sh 🐐  —  Model: %s\n  Type your message and press Enter. Use /help to see commands.\n\n",
-			m.backend.CurrentModel(),
-		)) + "\n"
+		m.content = welcomeContent(m.cfg, m.backend) + "\n"
 		m.render()
 
 	case "/quit", "/exit":
@@ -1908,7 +1962,9 @@ func (m ChatModel) compactHistory() tea.Cmd {
 		for _, msg := range msgs {
 			sb.WriteString(fmt.Sprintf("[%s]: %s\n\n", msg.Role, msg.Content))
 		}
-		summary, err := b.Chat(context.Background(), []backend.Message{
+		ctx, cancel := context.WithTimeout(context.Background(), backendRequestTimeout)
+		defer cancel()
+		summary, err := b.Chat(ctx, []backend.Message{
 			{Role: "user", Content: sb.String()},
 		}, backend.ChatOptions{Temperature: 0.3, NumPredict: 512})
 		if err != nil {
@@ -1935,7 +1991,9 @@ func (m ChatModel) saveCheckpoint(name string) tea.Cmd {
 		for _, msg := range msgs {
 			sb.WriteString(fmt.Sprintf("[%s]: %s\n\n", msg.Role, msg.Content))
 		}
-		summary, err := b.Chat(context.Background(), []backend.Message{
+		ctx, cancel := context.WithTimeout(context.Background(), backendRequestTimeout)
+		defer cancel()
+		summary, err := b.Chat(ctx, []backend.Message{
 			{Role: "user", Content: sb.String()},
 		}, backend.ChatOptions{Temperature: 0.3, NumPredict: 1024})
 		if err != nil {
@@ -1963,7 +2021,9 @@ func (m ChatModel) suggestCmd(task string) tea.Cmd {
 				"If multiple approaches exist, show the best one first.",
 			workDir, task,
 		)
-		result, err := b.Chat(context.Background(), []backend.Message{
+		ctx, cancel := context.WithTimeout(context.Background(), backendRequestTimeout)
+		defer cancel()
+		result, err := b.Chat(ctx, []backend.Message{
 			{Role: "user", Content: prompt},
 		}, backend.ChatOptions{Temperature: 0.2, NumPredict: 512})
 		if err != nil {
@@ -1982,7 +2042,9 @@ func (m ChatModel) explainCmd(shellCmd string) tea.Cmd {
 				"Mention any gotchas or common mistakes.\n\nCommand:\n```\n%s\n```",
 			shellCmd,
 		)
-		result, err := b.Chat(context.Background(), []backend.Message{
+		ctx, cancel := context.WithTimeout(context.Background(), backendRequestTimeout)
+		defer cancel()
+		result, err := b.Chat(ctx, []backend.Message{
 			{Role: "user", Content: prompt},
 		}, backend.ChatOptions{Temperature: 0.2, NumPredict: 768})
 		if err != nil {
@@ -2015,7 +2077,7 @@ func (m ChatModel) promptShellRun(shellCmd string) ChatModel {
 // executeShell runs a shell command and appends its output to the viewport.
 func (m ChatModel) executeShell(shellCmd string) ChatModel {
 	m.shellPending = ""
-	m.textarea.Placeholder = "Ask Billy anything... (Enter to send, Ctrl+D to quit)"
+	m.textarea.Placeholder = defaultPromptPlaceholder
 	m.textarea.Reset()
 
 	cmdStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Bold(true)
@@ -2024,13 +2086,11 @@ func (m ChatModel) executeShell(shellCmd string) ChatModel {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "sh", "-c", shellCmd) //nolint:gosec
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &out
-
-	err := cmd.Run()
-	output := out.String()
+	startDir := m.workDir
+	output, finalDir, err := runShellFromDir(ctx, startDir, shellCmd)
+	if finalDir != "" {
+		m.workDir = finalDir
+	}
 	if output == "" {
 		output = "(no output)"
 	}
@@ -2043,9 +2103,34 @@ func (m ChatModel) executeShell(shellCmd string) ChatModel {
 		m.appendCmdOutput(record, false)
 	}
 	if m.agentMode {
-		m.pendingCmdOutputs = append(m.pendingCmdOutputs, record)
+		m.pendingCmdOutputs = append(m.pendingCmdOutputs, formatCommandFeedback(shellCmd, output, startDir, m.workDir, err))
 	}
 	return m
+}
+
+func runShellFromDir(ctx context.Context, workDir, shellCmd string) (output, finalDir string, err error) {
+	wrapped := fmt.Sprintf("{ %s; }; status=$?; printf '\n%s%%s\n' \"$PWD\"; exit $status", shellCmd, pwdMarker)
+	cmd := exec.CommandContext(ctx, "sh", "-c", wrapped) //nolint:gosec
+	if workDir != "" {
+		cmd.Dir = workDir
+	}
+
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+
+	err = cmd.Run()
+	output = out.String()
+	finalDir = workDir
+
+	if idx := strings.LastIndex(output, pwdMarker); idx >= 0 {
+		pwdText := strings.TrimSpace(output[idx+len(pwdMarker):])
+		if pwdText != "" {
+			finalDir = pwdText
+		}
+		output = strings.TrimRight(output[:idx], "\n")
+	}
+	return output, finalDir, err
 }
 
 // agentSystemPrompt is prepended when in AGENT mode.
@@ -2057,7 +2142,9 @@ Rules:
 - When the user asks you to run, create, install, build, or do ANYTHING that requires shell commands, provide the EXACT commands in ` + "```bash" + ` code blocks — never just describe them.
 - When creating files, include the full file content in a code block. Put the filename as a comment on the first line (e.g. // main.go).
 - Break complex tasks into sequential steps. Each step gets its own ` + "```bash" + ` block.
-- After each command runs, the output is automatically fed back to you. Analyze it: if there are errors, diagnose and provide a corrected command. Keep iterating until the task succeeds.
+- After each command runs, the output and updated working directory are automatically fed back to you. Analyze them: if there are errors, diagnose and provide a corrected command. Keep iterating until the task succeeds.
+- When the user's request has been satisfied and verification passes, stop. Do not output more bash blocks. Briefly explain that the task is complete.
+- Do not keep re-running the same verification step after it has already succeeded.
 - Be direct and action-oriented. Minimize prose, maximize commands.
 - If something could be destructive (rm -rf, DROP TABLE, etc), warn clearly before the block.
 
@@ -2126,10 +2213,6 @@ func (m ChatModel) saveAdminConfig(ac adminConfig) error {
 // handleAdminCommand routes /admin sub-commands.
 func (m ChatModel) handleAdminCommand(parts []string) (ChatModel, tea.Cmd) {
 	m.textarea.Reset()
-	if m.lic == nil || m.lic.Free() {
-		m.append(errorStyle.Render("⛔ Admin controls require Pro or higher. Upgrade at https://billysh.online\n\n"))
-		return m, nil
-	}
 	subCmd := parts[0]
 	switch subCmd {
 	case "setup":
@@ -2149,13 +2232,13 @@ func (m ChatModel) handleAdminCommand(parts []string) (ChatModel, tea.Cmd) {
 			}
 		}
 		if err := m.store.SetEncrypted("admin_pin", []byte(pin)); err != nil {
-			m.append(errorStyle.Render("Failed to save PIN: "+err.Error()+"\n\n"))
+			m.append(errorStyle.Render("Failed to save PIN: " + err.Error() + "\n\n"))
 			return m, nil
 		}
 		ac, _ := m.loadAdminConfig()
 		ac.Locked = false
 		if err := m.saveAdminConfig(ac); err != nil {
-			m.append(errorStyle.Render("Failed to save admin config: "+err.Error()+"\n\n"))
+			m.append(errorStyle.Render("Failed to save admin config: " + err.Error() + "\n\n"))
 			return m, nil
 		}
 		m.append(dimStyle.Render("✅ Admin PIN set. Use /admin lock to lock mode to TEACH.\n\n"))
@@ -2170,7 +2253,7 @@ func (m ChatModel) handleAdminCommand(parts []string) (ChatModel, tea.Cmd) {
 		ac.Locked = true
 		ac.LockMode = "teach"
 		if err := m.saveAdminConfig(ac); err != nil {
-			m.append(errorStyle.Render("Failed to save admin config: "+err.Error()+"\n\n"))
+			m.append(errorStyle.Render("Failed to save admin config: " + err.Error() + "\n\n"))
 			return m, nil
 		}
 		m.teachMode = true
@@ -2187,7 +2270,7 @@ func (m ChatModel) handleAdminCommand(parts []string) (ChatModel, tea.Cmd) {
 		ac, _ := m.loadAdminConfig()
 		ac.Locked = false
 		if err := m.saveAdminConfig(ac); err != nil {
-			m.append(errorStyle.Render("Failed to save admin config: "+err.Error()+"\n\n"))
+			m.append(errorStyle.Render("Failed to save admin config: " + err.Error() + "\n\n"))
 			return m, nil
 		}
 		m.append(dimStyle.Render("🔓 Mode lock removed. Users can now switch modes freely.\n\n"))
@@ -2202,7 +2285,7 @@ func (m ChatModel) handleAdminCommand(parts []string) (ChatModel, tea.Cmd) {
 		ac, _ := m.loadAdminConfig()
 		ac.Curriculum = text
 		if err := m.saveAdminConfig(ac); err != nil {
-			m.append(errorStyle.Render("Failed to save curriculum: "+err.Error()+"\n\n"))
+			m.append(errorStyle.Render("Failed to save curriculum: " + err.Error() + "\n\n"))
 			return m, nil
 		}
 		m.append(dimStyle.Render("✅ Curriculum context saved.\n\n"))
@@ -2211,7 +2294,7 @@ func (m ChatModel) handleAdminCommand(parts []string) (ChatModel, tea.Cmd) {
 	case "status":
 		ac, err := m.loadAdminConfig()
 		if err != nil {
-			m.append(errorStyle.Render("Failed to load admin config: "+err.Error()+"\n\n"))
+			m.append(errorStyle.Render("Failed to load admin config: " + err.Error() + "\n\n"))
 			return m, nil
 		}
 		pinSet := "not set"
@@ -2273,7 +2356,9 @@ func (m ChatModel) sendHintCmd(hintMsg backend.Message) tea.Cmd {
 	}
 	b := m.backend
 	return func() tea.Msg {
-		content, err := b.Chat(context.Background(), fullHistory, opts)
+		ctx, cancel := context.WithTimeout(context.Background(), backendRequestTimeout)
+		defer cancel()
+		content, err := b.Chat(ctx, fullHistory, opts)
 		return chatMsg{content: content, err: err}
 	}
 }
@@ -2312,6 +2397,167 @@ func extractShellCommands(content string) []string {
 	return cmds
 }
 
+func shouldStopAutopilot(records []string) bool {
+	if len(records) == 0 {
+		return false
+	}
+	if recordBatchHasError(records) {
+		return false
+	}
+	for _, record := range records {
+		if recordShowsSuccessfulVerification(record) {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeCommandBatch(cmds []string) string {
+	cleaned := make([]string, 0, len(cmds))
+	for _, cmd := range cmds {
+		cmd = strings.TrimSpace(strings.ReplaceAll(cmd, "\r\n", "\n"))
+		if cmd != "" {
+			cleaned = append(cleaned, cmd)
+		}
+	}
+	return strings.Join(cleaned, "\n---\n")
+}
+
+func normalizeRecordBatch(records []string) string {
+	cmds := make([]string, 0, len(records))
+	for _, record := range records {
+		cmds = append(cmds, extractShellCommands(record)...)
+	}
+	return normalizeCommandBatch(cmds)
+}
+
+func recordBatchHasError(records []string) bool {
+	for _, record := range records {
+		if strings.Contains(strings.ToLower(record), "[exit error:") || strings.Contains(strings.ToLower(record), "exit error:") {
+			return true
+		}
+	}
+	return false
+}
+
+func splitShellSteps(block string) []string {
+	normalized := strings.NewReplacer("&&", "\n", ";", "\n", "||", "\n").Replace(block)
+	rawLines := strings.Split(normalized, "\n")
+	steps := make([]string, 0, len(rawLines))
+	for _, line := range rawLines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		steps = append(steps, line)
+	}
+	return steps
+}
+
+func stepMatchesAnyPrefix(step string, prefixes []string) bool {
+	step = strings.ToLower(strings.TrimSpace(step))
+	for _, prefix := range prefixes {
+		if strings.HasPrefix(step, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func outputLooksSuccessful(text string) bool {
+	hints := []string{
+		"pass", "passed", "success", "successful", "ok\t", "ok ", "compiled successfully",
+		"build completed", "ready in", "local:", "localhost", "127.0.0.1", "listening on",
+		"server running", "application started", "done in", "finished in", "<!doctype html",
+		"<html", "200 ok", "http/1.1 200", "http/2 200", "vite v", "webpack compiled",
+	}
+	for _, hint := range hints {
+		if strings.Contains(text, hint) {
+			return true
+		}
+	}
+	return false
+}
+
+func recordShowsSuccessfulVerification(record string) bool {
+	blocks := extractShellCommands(record)
+	if len(blocks) == 0 {
+		return false
+	}
+
+	immediatePrefixes := []string{
+		"go test", "go build",
+		"npm test", "npm run test", "npm run build",
+		"pnpm test", "pnpm build",
+		"yarn test", "yarn build",
+		"bun test", "bun run build",
+		"cargo test", "cargo build",
+		"pytest", "python -m pytest", "python3 -m pytest",
+		"next build",
+	}
+
+	runtimePrefixes := []string{
+		"go run",
+		"npm run dev", "npm start",
+		"pnpm dev", "pnpm start",
+		"yarn dev", "yarn start",
+		"bun run dev", "bun run start",
+		"cargo run",
+		"uv run", "uvicorn", "vite", "next dev",
+		"curl ", "wget ", "python ", "python3 ",
+	}
+
+	recordLower := strings.ToLower(record)
+	hasImmediate := false
+	hasRuntime := false
+	for _, block := range blocks {
+		for _, step := range splitShellSteps(block) {
+			switch {
+			case stepMatchesAnyPrefix(step, immediatePrefixes):
+				hasImmediate = true
+			case stepMatchesAnyPrefix(step, runtimePrefixes):
+				hasRuntime = true
+			}
+		}
+	}
+
+	if hasRuntime {
+		return outputLooksSuccessful(recordLower)
+	}
+	return hasImmediate
+}
+
+func formatCommandFeedback(shellCmd, output, startDir, endDir string, runErr error) string {
+	output = strings.TrimRight(output, "\n")
+	if output == "" {
+		output = "(no output)"
+	}
+
+	var sb strings.Builder
+	sb.WriteString("Command block:\n```bash\n")
+	sb.WriteString(shellCmd)
+	sb.WriteString("\n```\n")
+	if startDir != "" {
+		sb.WriteString("\nWorking directory before command:\n```text\n")
+		sb.WriteString(startDir)
+		sb.WriteString("\n```\n")
+	}
+	if endDir != "" {
+		sb.WriteString("\nWorking directory after command:\n```text\n")
+		sb.WriteString(endDir)
+		sb.WriteString("\n```\n")
+	}
+	if runErr != nil {
+		sb.WriteString("\nExit error: ")
+		sb.WriteString(runErr.Error())
+		sb.WriteString("\n")
+	}
+	sb.WriteString("\nCommand output:\n```text\n")
+	sb.WriteString(output)
+	sb.WriteString("\n```")
+	return sb.String()
+}
+
 // promptNextQueuedCmd pops the first command from cmdQueue and shows its
 // permission prompt. Call this after a command completes or is skipped.
 func (m ChatModel) promptNextQueuedCmd() ChatModel {
@@ -2330,11 +2576,21 @@ func (m ChatModel) flushCmdOutputs() (ChatModel, tea.Cmd) {
 		return m, nil
 	}
 	combined := strings.Join(m.pendingCmdOutputs, "\n\n")
+	if m.autopilotMode {
+		m.lastAutoCommandSig = normalizeRecordBatch(m.pendingCmdOutputs)
+		m.lastAutoCommandSuccess = !recordBatchHasError(m.pendingCmdOutputs)
+	}
+	if m.autopilotMode && shouldStopAutopilot(m.pendingCmdOutputs) {
+		m.pendingCmdOutputs = nil
+		m.append(dimStyle.Render("✅ Autopilot verified a successful result and stopped.\nBilly believes the task is complete.\n\n"))
+		return m, nil
+	}
+	feedback := combined + fmt.Sprintf("\n\nCurrent working directory for the next step:\n```text\n%s\n```\n\nDecide whether the user's task is now complete. If it is complete, do not suggest any more commands. Briefly explain that it is done and stop. Only produce another bash block if more work is truly required.", m.workDir)
 	m.pendingCmdOutputs = nil
-	m.history = append(m.history, backend.Message{Role: "user", Content: combined})
+	m.history = append(m.history, backend.Message{Role: "user", Content: feedback})
 	m.tokenEstimate = estimateTokens(m.history)
 	if m.store != nil && m.conversationID != "" {
-		_ = m.store.AddMessage(uuid.New().String(), m.conversationID, "user", combined)
+		_ = m.store.AddMessage(uuid.New().String(), m.conversationID, "user", feedback)
 	}
 	cmdLabelStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Bold(true)
 	m.append(cmdLabelStyle.Render("Command >") + " " + dimStyle.Render("output sent to Billy...\n\n"))

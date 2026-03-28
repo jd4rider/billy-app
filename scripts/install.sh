@@ -3,16 +3,15 @@ set -euo pipefail
 
 BILLY_INSTALL_DIR="${BILLY_INSTALL_DIR:-$HOME/.billy/bin}"
 REPO="jd4rider/billy-app"
-FULL=false
-
-# Parse flags
 for arg in "$@"; do
   case "$arg" in
-    --full) FULL=true ;;
     --help|-h)
-      echo "Usage: install.sh [--full]"
-      echo "  --full   Install Billy Full (Ollama bundled, auto-starts)"
+      echo "Usage: install.sh"
+      echo "Installs the current Billy release. Ollama is installed separately."
       exit 0 ;;
+    --full)
+      echo "The bundled Ollama install is no longer supported. Install Ollama separately from https://ollama.com." >&2
+      exit 1 ;;
   esac
 done
 
@@ -47,13 +46,8 @@ get_latest_version() {
 
 main() {
   echo ""
-  echo -e "${BOLD}  Billy.sh installer${NC}"
-  if $FULL; then
-    echo -e "  Installing: ${GREEN}Billy Full${NC} (Ollama bundled)"
-  else
-    echo -e "  Installing: ${BLUE}Billy Slim${NC} (requires Ollama)"
-  fi
-  echo -e "  ${YELLOW}⚠  Pre-Alpha — expect rough edges${NC}"
+  echo -e "${BOLD}  Billy installer${NC}"
+  echo -e "  Installing: ${BLUE}Billy${NC} (local-first terminal assistant)"
   echo ""
 
   local platform version binary_name url tmpdir
@@ -65,11 +59,7 @@ main() {
   [[ -z "$version" ]] && error "Could not determine latest version"
   info "Version:  $version"
 
-  if $FULL; then
-    binary_name="billy-full"
-  else
-    binary_name="billy"
-  fi
+  binary_name="billy"
 
   url="https://github.com/$REPO/releases/download/$version/${binary_name}_${platform}.tar.gz"
   info "Downloading from: $url"
@@ -84,7 +74,6 @@ main() {
 
   mkdir -p "$BILLY_INSTALL_DIR"
 
-  # The binary in the archive may be named billy-full or billy depending on variant
   local extracted_bin
   extracted_bin=$(find "$tmpdir" -maxdepth 1 -type f -name "${binary_name}*" ! -name "*.tar.gz" | head -1)
   [[ -z "$extracted_bin" ]] && error "Binary not found in archive"
@@ -106,18 +95,12 @@ main() {
     warn "Run: source $shell_config  (or open a new terminal)"
   fi
 
-  # If slim, check for ollama
-  if ! $FULL; then
-    echo ""
-    if command -v ollama &>/dev/null; then
-      success "Ollama found: $(command -v ollama)"
-    else
-      warn "Ollama not found."
-      warn "Install it at: https://ollama.com"
-      warn "Or reinstall with --full to get Ollama bundled:"
-      echo ""
-      echo -e "  ${BLUE}curl -fsSL https://raw.githubusercontent.com/$REPO/main/scripts/install.sh | bash -s -- --full${NC}"
-    fi
+  echo ""
+  if command -v ollama &>/dev/null; then
+    success "Ollama found: $(command -v ollama)"
+  else
+    warn "Ollama not found."
+    warn "Install it at: https://ollama.com"
   fi
 
   echo ""
@@ -126,8 +109,9 @@ main() {
   echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
   echo ""
   echo -e "  ${BOLD}Start Billy:${NC}              ${BLUE}$binary_name${NC}"
-  echo -e "  ${BOLD}Pull a model:${NC}             ${BLUE}/pull llama3.2${NC}"
-  echo -e "  ${BOLD}Help:${NC}                     ${BLUE}/help${NC}"
+  echo -e "  ${BOLD}Pull a model:${NC}             ${BLUE}ollama pull qwen2.5-coder:14b${NC}"
+  echo -e "  ${BOLD}Try a first prompt:${NC}       ${BLUE}$binary_name \"explain this repository\"${NC}"
+  echo -e "  ${BOLD}Help inside Billy:${NC}       ${BLUE}/help${NC}"
   echo ""
   echo -e "  Source: https://github.com/$REPO"
   echo ""

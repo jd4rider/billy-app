@@ -22,18 +22,7 @@ type License struct {
 
 // Badge returns the display label for the status bar.
 func (l *License) Badge() string {
-	switch l.Tier {
-	case TierPro:
-		return "[PRO]"
-	case TierPremium:
-		return "[PREMIUM]"
-	case TierTeam:
-		return "[TEAM]"
-	case TierEnterprise:
-		return "[ENTERPRISE]"
-	default:
-		return "[FREE]"
-	}
+	return "[OPEN]"
 }
 
 // IsActive returns true if the license has not expired.
@@ -56,4 +45,3 @@ func (l *License) EffectiveTier() Tier {
 func (l *License) Free() bool {
 	return l.EffectiveTier() == TierFree
 }
-

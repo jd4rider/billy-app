@@ -11,7 +11,6 @@ import (
 
 const (
 	defaultOllamaURL = "http://localhost:11434"
-	customBackendTip = "Activate Billy Pro or higher, or switch back to local Ollama."
 )
 
 // NormalizeType canonicalizes a backend type string for config/env parsing.
@@ -34,9 +33,11 @@ func ResolveModel(cfg *config.Config) string {
 	return strings.TrimSpace(cfg.Ollama.Model)
 }
 
-// NewFromConfig builds the configured backend, enforcing the paid-license gate
-// for non-local providers.
+// NewFromConfig builds the configured backend. The license parameter is kept so
+// Billy can reintroduce optional paid convenience tiers later without changing
+// the backend factory API again.
 func NewFromConfig(cfg *config.Config, lic *license.License) (Backend, error) {
+	_ = lic
 	kind := NormalizeType(cfg.Backend.Type)
 	model := ResolveModel(cfg)
 
@@ -49,12 +50,6 @@ func NewFromConfig(cfg *config.Config, lic *license.License) (Backend, error) {
 		return NewOllama(baseURL, model), nil
 
 	case "custom":
-		if lic == nil || lic.Free() {
-			return nil, &BillyError{
-				Message: "Custom endpoints require a paid Billy license",
-				Hint:    customBackendTip,
-			}
-		}
 		if strings.TrimSpace(cfg.Backend.URL) == "" {
 			return nil, &BillyError{
 				Message: "No custom backend URL configured",

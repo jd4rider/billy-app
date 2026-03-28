@@ -1,12 +1,11 @@
-# Billy.sh
+# Billy
 
-[![Alpha](https://img.shields.io/badge/status-alpha-yellow?style=flat-square)](https://github.com/jd4rider/billy-app/releases)
 [![Go](https://img.shields.io/badge/Go-1.24-00ADD8?style=flat-square&logo=go)](https://go.dev)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](./LICENSE)
 
-> Your local AI coding assistant. No subscription required.
+> Local AI coding assistant for the terminal.
 
-**Billy.sh** is a Copilot CLI alternative with local [Ollama](https://ollama.com) by default and paid support for custom OpenAI-compatible endpoints. It runs entirely on your machine in local mode, works offline, and has no recurring cost for the core local experience. Built with **[Go](https://go.dev)** and the [Charm](https://charm.sh) terminal toolkit for a polished terminal experience.
+**Billy** is a local-first coding assistant for the terminal. It uses [Ollama](https://ollama.com) by default, can also connect to OpenAI-compatible endpoints, runs fully on your machine in local mode, and stays open by default. It is built with **[Go](https://go.dev)** and the [Charm](https://charm.sh) terminal toolkit for a polished TUI workflow.
 
 ---
 
@@ -25,7 +24,7 @@
 ## Features
 
 - 💬 **Interactive TUI** — full-screen chat with scrollable history, built with [Bubble Tea](https://github.com/charmbracelet/bubbletea) and [Lipgloss](https://github.com/charmbracelet/lipgloss)
-- 🤖 **Local-first AI** — Ollama by default, with paid support for custom OpenAI-compatible endpoints
+- 🤖 **Local-first AI** — Ollama by default, with optional OpenAI-compatible endpoints if you want them
 - 🤖 **Agentic mode (default)** — Billy detects shell commands in responses and asks permission to run them, Copilot-style
 - 🧠 **Memory system** — Billy learns about you over time; just say *"remember that..."*
 - 📜 **Conversation history** — resume past sessions with an interactive `/history` picker
@@ -33,7 +32,7 @@
 - 💾 **Session checkpoints** — `/session` saves named AI-generated checkpoints you can reload
 - 🎨 **Syntax highlighting** — code blocks rendered with full markdown support
 - 🔄 **Model management** — list and switch models on any backend; pull new ones directly from Ollama
-- 🔑 **License tiers** — Free / Pro / Premium / Team / Enterprise; activate with `/activate`, free a seat with `/deactivate`
+- 🔓 **Open-core by default** — the full local tool ships unlocked; support Billy through setup help, sponsorship, or future convenience bundles
 - 🖥 **One-shot mode** — run `billy "explain this"` directly from the terminal without launching the TUI
 - ⚙️ **Simple config** — single TOML file at `~/.localai/config.toml`
 - 💾 **SQLite backend** — all history, memories, and settings stored locally at `~/.localai/history.db`
@@ -44,7 +43,7 @@
 
 - [Go 1.24+](https://go.dev/dl/) *(build from source only)*
 - [Ollama](https://ollama.com) running locally on `localhost:11434` for the default local mode
-- Or a paid custom endpoint configured via `backend.type = "custom"`
+- Or an OpenAI-compatible endpoint configured via `backend.type = "custom"`
 
 ---
 
@@ -52,20 +51,15 @@
 
 ### macOS (Homebrew)
 ```bash
-brew install jd4rider/billy/billy
+brew tap jd4rider/billy
+brew install billy
 ```
 
-### Linux / macOS (install script — slim, requires Ollama)
+### Linux / macOS (install script)
 ```bash
 curl -fsSL https://raw.githubusercontent.com/jd4rider/billy-app/main/scripts/install.sh | bash
 ```
 Then [install Ollama](https://ollama.com) if you haven't already.
-
-### Full install (Ollama bundled — auto-starts headless)
-```bash
-curl -fsSL https://raw.githubusercontent.com/jd4rider/billy-app/main/scripts/install.sh | bash -s -- --full
-```
-The full variant (~80 MB) bundles a headless Ollama binary that Billy starts automatically — no separate install needed.
 
 ### Windows (Scoop)
 ```powershell
@@ -81,12 +75,7 @@ go build -o billy ./cmd/billy
 ./billy
 ```
 
-| Variant | Ollama | Binary size |
-|---|---|---|
-| Slim | Detects/prompts — you install Ollama | ~10 MB |
-| Full | Bundled + auto-starts headless | ~80 MB |
-
-> **Alpha** — stable enough to use, still moving fast. [Star the repo](https://github.com/jd4rider/billy-app) to follow along.
+> Billy is still moving quickly, but the core local workflow is ready to use. [Star the repo](https://github.com/jd4rider/billy-app) to follow along.
 
 ---
 
@@ -99,11 +88,17 @@ ollama pull qwen2.5-coder:14b   # Billy's default model
 # Launch the TUI
 billy
 
-# Or use one-shot mode directly
+# First prompt ideas
 billy "explain what this codebase does"
+
+# Or use one-shot mode directly
 billy read ./src
 billy fix broken_code.go
 cat error.log | billy "what's causing this?"
+
+# Agentic one-shot mode
+billy --agent "fix the failing tests in this repo"
+billy --yolo "set up the project and keep going until it builds"
 ```
 
 ---
@@ -134,6 +129,11 @@ cat error.log | billy "what's causing this?"
 git diff | billy "summarize these changes"
 ```
 
+One-shot flags:
+
+- `--agent` enables approval-gated command execution loops in one-shot mode
+- `--yolo` enables one-shot agent mode with auto-approved commands
+
 ---
 
 ## TUI Commands
@@ -163,8 +163,10 @@ Type `/` in the chat to open the **command picker** — scroll through all comma
 | `/model <name>` | Switch to a different model |
 | `/pull <name>` | Download a model from the Ollama library (local backend only) |
 | `/mode agent` | Enable agentic mode (default) — auto-detects and runs shell commands |
+| `/mode autopilot` | Enable fully autonomous agent mode — auto-runs commands and keeps iterating |
 | `/mode chat` | Disable command detection — pure conversation mode |
-| `/mode teach` | Teaching mode — Socratic guidance, step-by-step (coming soon) |
+| `/mode teach` | Teaching mode — Socratic guidance, step-by-step |
+| `/yolo` | Toggle session-wide auto-approve for all suggested commands |
 
 ### Memory
 
@@ -206,13 +208,11 @@ When Billy suggests a shell command in a bash block, it will prompt:
 - **A** — always run this command type for this session
 - **N / S** — skip (cancels pending queue)
 
-### License & Account
+### Access & Support
 
 | Command | Description |
 |---|---|
-| `/activate` | Prompt for your Billy license key and activate this machine |
-| `/deactivate` | Release this machine's seat back to your license |
-| `/license` | Show current license tier and status |
+| `/license` | Show Billy's current open-core access model and support links |
 
 ### General
 
@@ -245,22 +245,26 @@ The current mode and working directory are shown in the status bar at the bottom
 | Mode | Badge | Behaviour |
 |---|---|---|
 | **Agent** (default) | `[AGENT]` cyan | Detects bash blocks in responses, queues them for permission-gated execution |
+| **Autopilot** | `[AUTO]` amber | Auto-runs suggested commands and feeds output back until the task settles |
 | **Chat** | `[CHAT]` dim | No command detection — pure conversation |
-| **Teach** *(coming soon)* | `[TEACH]` green | Socratic guidance; shows commands as "type this yourself" prompts |
+| **Teach** | `[TEACH]` green | Socratic guidance; shows commands as "type this yourself" prompts |
 
 ---
 
-## Pricing
+## Sustainability
 
-| Tier | Price | Limits |
-|---|---|---|
-| **Free** | $0 | 20 messages/session, 5 history slots, local Ollama only |
-| **Pro** | $19 one-time | Unlimited messages, all backends, full history, all commands |
-| **Premium** | $49 one-time | Pro + future voice mode, IDE plugins, priority support |
-| **Team** | ~$14/seat | Bulk seats, shared memory, admin controls |
-| **Enterprise** | Custom | Unlimited seats, self-hosted, SLA — call [406-396-7246](tel:+14063967246) |
+Billy currently ships fully unlocked.
 
-Upgrade at **[billysh.online](https://billysh.online)**, then run `/activate` inside Billy.
+You can use the full local tool for free, wire up Ollama or your own compatible backend yourself, and keep your workflow local-first.
+
+Build software and games that are free, honest, and clean - funded by people who believe in them, not by exploiting users.
+
+If Billy helps you, support the project through:
+
+- setup help or guided installation
+- [GitHub Sponsors](https://github.com/sponsors/jd4rider)
+- [Buy Me a Coffee](https://buymeacoffee.com/jd4rider)
+- future convenience bundles or supporter packs
 
 ---
 
@@ -278,7 +282,7 @@ model       = "qwen2.5-coder:14b"
 temperature = 0.7
 ```
 
-Custom endpoint example for paid tiers:
+Custom endpoint example:
 
 ```toml
 [backend]
@@ -290,10 +294,10 @@ api_key = "sk-..."
 
 | Key | Default | Description |
 |---|---|---|
-| `backend.type` | `ollama` | Backend (`ollama` or paid `custom`) |
+| `backend.type` | `ollama` | Backend (`ollama` or `custom`) |
 | `backend.url` | `http://localhost:11434` | Backend base URL |
-| `backend.model` | unset | Model for paid custom endpoints |
-| `backend.api_key` | unset | API key for paid custom endpoints |
+| `backend.model` | unset | Model for custom endpoints |
+| `backend.api_key` | unset | API key for custom endpoints |
 | `ollama.model` | `qwen2.5-coder:14b` | Default model for Ollama |
 | `ollama.temperature` | `0.7` | Sampling temperature (0.0–1.0) |
 
@@ -322,20 +326,18 @@ billy
 | ✅ | Model list, switch & pull |
 | ✅ | Agentic mode — shell command detection & permission prompts |
 | ✅ | `/run` shell execution |
-| ✅ | License system — Free / Pro / Premium / Team / Enterprise |
-| ✅ | Lemon Squeezy activation with encrypted local activation storage |
-| ✅ | Binary distribution — slim + fat (bundled Ollama) |
-| ✅ | Homebrew tap, Scoop bucket, .deb/.rpm/.apk packages |
+| ✅ | Open-core access model with optional supporter paths |
+| ✅ | Binary distribution — script install, Homebrew, Scoop, .deb/.rpm/.apk |
 | ✅ | [billysh.online](https://billysh.online) landing page live |
 | ✅ | [Starlight docs site](https://docs.billysh.online) |
 | ✅ | One-shot CLI mode (`billy "prompt"`, `billy read/explain/fix/run`) |
-| ✅ | Paid custom / OpenAI-compatible HTTP backends |
+| ✅ | Custom / OpenAI-compatible HTTP backends |
 | ✅ | Context compaction (`/compact`) with token estimate in status bar |
 | ✅ | Session checkpoints (`/session`, `/session list`, `/session load`) |
 | ✅ | `/pwd`, `/cd` with live directory autocomplete picker |
 | ✅ | `/ls`, `/git`, `/suggest`, `/explain` shell tools |
 | ✅ | Working directory shown abbreviated in status bar |
-| 🔜 | Teaching mode (`/mode teach`) + admin controls |
+| ✅ | Teaching mode (`/mode teach`) + admin controls |
 | 🔜 | Groq / Billy relay presets |
 | 🔜 | Integration tests |
 | 🔜 | Voice mode (Whisper + Piper TTS) |
@@ -354,15 +356,15 @@ billy-app/
 ├── internal/
 │   ├── backend/        # AI backend clients (Ollama + custom OpenAI-compatible endpoints)
 │   ├── config/         # TOML config + env var overrides
-│   ├── launcher/       # Ollama detection, start, embed (slim/fat)
-│   ├── license/        # Lemon Squeezy activation/validation + tier constants
+│   ├── launcher/       # Ollama detection and startup helpers
+│   ├── license/        # Legacy activation plumbing / future supporter-key experiments
 │   ├── memory/         # Memory detection & system prompt builder
 │   ├── oneshot/        # Headless one-shot execution (no TUI)
 │   ├── store/          # SQLite: history, memories, kv (encrypted), checkpoints
 │   └── tui/            # Bubble Tea UI (chat view, history picker)
 ├── scripts/
-│   ├── install.sh      # Installer (slim or --full)
-│   └── fetch-ollama.sh # Download ollama binary for fat CI builds
+│   ├── install.sh      # Main installer
+│   └── fetch-ollama.sh # Helper for packaging workflows
 ├── .goreleaser.yml
 ├── go.mod
 └── README.md
@@ -372,7 +374,7 @@ billy-app/
 
 ## Contributing
 
-This is an alpha project — feedback, issues, and PRs are very welcome. [Open an issue](https://github.com/jd4rider/billy-app/issues) or start a discussion.
+Feedback, issues, and PRs are very welcome. [Open an issue](https://github.com/jd4rider/billy-app/issues) or start a discussion.
 
 ---
 

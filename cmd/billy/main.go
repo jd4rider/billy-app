@@ -11,7 +11,6 @@ import (
 	"github.com/jonathanforrider/billy/internal/backend"
 	"github.com/jonathanforrider/billy/internal/config"
 	"github.com/jonathanforrider/billy/internal/launcher"
-	"github.com/jonathanforrider/billy/internal/license"
 	"github.com/jonathanforrider/billy/internal/oneshot"
 	"github.com/jonathanforrider/billy/internal/store"
 	"github.com/jonathanforrider/billy/internal/tui"
@@ -32,13 +31,29 @@ func main() {
 
 	// One-shot mode: if non-flag args remain, run headlessly
 	var promptArgs []string
+	serveMode := false
+	agentMode := false
+	yoloMode := false
 	for _, a := range os.Args[1:] {
-		if a != "--version" && a != "-version" {
+		if a == "serve" || a == "--serve" {
+			serveMode = true
+		} else if a == "--agent" || a == "-a" {
+			agentMode = true
+		} else if a == "--yolo" {
+			yoloMode = true
+			agentMode = true
+		} else if a != "--version" && a != "-version" {
 			promptArgs = append(promptArgs, a)
 		}
 	}
+
+	if serveMode {
+		runServe()
+		return
+	}
+
 	if len(promptArgs) > 0 {
-		if err := oneshot.Run(promptArgs); err != nil {
+		if err := oneshot.Run(promptArgs, oneshot.Options{Agent: agentMode, Yolo: yoloMode}); err != nil {
 			fmt.Fprintf(os.Stderr, "billy: %v\n", err)
 			os.Exit(1)
 		}
@@ -60,8 +75,7 @@ func main() {
 		defer s.Close()
 	}
 
-	lic, _ := license.LoadCached(s)
-	b, err := backend.NewFromConfig(cfg, lic)
+	b, err := backend.NewFromConfig(cfg, nil)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error configuring backend: %v\n", err)
 		os.Exit(1)

@@ -15,7 +15,7 @@ import (
 type Result struct {
 	AlreadyRunning bool
 	Started        bool
-	Bundled        bool   // fat build used embedded binary
+	Bundled        bool // fat build used embedded binary
 	BinaryPath     string
 }
 
@@ -128,8 +128,7 @@ func startProcess(ctx context.Context, binPath, serverURL string) (stop func(), 
 func notFoundError() error {
 	return fmt.Errorf(`Ollama is not installed or not running.
 
-  Download Ollama:       https://ollama.com
-  Or get Billy Full:    https://github.com/jd4rider/billy-app/releases/latest
+  Install Ollama:        https://ollama.com
 
-  After installing Ollama, run:  ollama pull mistral`)
+  After installing Ollama, run:  ollama pull qwen2.5-coder:14b`)
 }
