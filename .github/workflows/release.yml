@@ -9,8 +9,8 @@ permissions:
   contents: write
 
 jobs:
-  release-slim:
-    name: Release slim builds
+  release-cli:
+    name: Release Billy CLI
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -27,68 +27,3 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           SCOOP_BUCKET_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}
-
-  release-fat:
-    name: Release fat build (${{ matrix.goos }}/${{ matrix.goarch }})
-    needs: release-slim
-    strategy:
-      matrix:
-        include:
-          - runner: ubuntu-latest
-            goos: linux
-            goarch: amd64
-            ollama_slug: linux-amd64
-            archive_suffix: tar.gz
-          - runner: ubuntu-latest
-            goos: linux
-            goarch: arm64
-            ollama_slug: linux-arm64
-            archive_suffix: tar.gz
-          - runner: macos-latest
-            goos: darwin
-            goarch: amd64
-            ollama_slug: darwin
-            archive_suffix: tar.gz
-          - runner: macos-latest
-            goos: darwin
-            goarch: arm64
-            ollama_slug: darwin
-            archive_suffix: tar.gz
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.24'
-
-      - name: Install zstd (Linux only)
-        if: matrix.goos == 'linux'
-        run: sudo apt-get install -y zstd
-
-      - name: Download Ollama binary
-        run: bash scripts/fetch-ollama.sh ${{ matrix.goos }} ${{ matrix.goarch }}
-
-      - name: Build fat binary
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: 0
-        run: |
-          DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-          COMMIT=$(git rev-parse --short HEAD)
-          go build -tags fat \
-            -ldflags "-s -w -X main.version=${{ github.ref_name }} -X main.commit=${COMMIT} -X main.date=${DATE}" \
-            -o billy-full_${{ matrix.goos }}_${{ matrix.goarch }} \
-            ./cmd/billy
-
-      - name: Create archive
-        run: |
-          tar czf billy-full_${{ matrix.goos }}_${{ matrix.goarch }}.tar.gz \
-            billy-full_${{ matrix.goos }}_${{ matrix.goarch }}
-
-      - name: Upload to release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: billy-full_${{ matrix.goos }}_${{ matrix.goarch }}.tar.gz
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

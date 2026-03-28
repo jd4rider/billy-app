@@ -51,7 +51,8 @@
 
 ### macOS (Homebrew)
 ```bash
-brew install jd4rider/billy/billy
+brew tap jd4rider/billy
+brew install billy
 ```
 
 ### Linux / macOS (install script)
